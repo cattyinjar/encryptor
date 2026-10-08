@@ -1,0 +1,576 @@
+"""Tkinter GUI：加密页 / 解密页 / 插件管理页。
+
+约定：所有控件操作都在主线程；加密解密任务在后台线程执行，
+通过 queue + root.after 把日志、进度、完成事件传回主线程。
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import threading
+import time
+import traceback
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
+from typing import Optional
+
+from . import ENC_EXTENSION, __version__
+from . import engine, plugin_manager
+from .container import ContainerError
+from .sdk import CancelledError, IntegrityError, PluginError, WrongPasswordError
+
+APP_TITLE = f"Encryptor 单机加密解密工具 v{__version__}"
+GEOMETRY = "820x640"
+
+
+class EncryptorApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        root.title(APP_TITLE)
+        root.geometry(GEOMETRY)
+        root.minsize(720, 560)
+
+        self.registry = plugin_manager.PluginRegistry()
+        self._event_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._busy = False
+        self._cancel_flag: Optional[threading.Event] = None
+        self._worker: Optional[threading.Thread] = None
+        self._active_progress = (None, None)
+
+        self._build_style()
+        self._build_widgets()
+        self.reload_plugins(quiet=True)
+        self.root.after(80, self._poll_events)
+
+    # ------------------------------------------------------------------
+    # 界面搭建
+    # ------------------------------------------------------------------
+
+    def _build_style(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        base = ttk.Frame(self.root)
+        base.grid(row=0, column=0, sticky="nsew")
+        self.root.rowconfigure(0, weight=1)
+        self.root.columnconfigure(0, weight=1)
+
+        pad = {"padx": 14, "pady": (10, 4)}
+        self.notebook = ttk.Notebook(base)
+        self.notebook.grid(row=0, column=0, sticky="nsew", **pad)
+        self.log_panel = ttk.LabelFrame(base, text="日志")
+        self.log_panel.grid(row=1, column=0, sticky="nsew", **{"padx": 14, "pady": (4, 0)})
+        self.status_bar = ttk.Frame(base)
+        self.status_bar.grid(row=2, column=0, sticky="ew", padx=14, pady=(4, 8))
+        base.rowconfigure(0, weight=1)
+        base.columnconfigure(0, weight=1)
+
+        # 日志面板
+        self.log_text = tk.Text(
+            self.log_panel, height=8, state="disabled", wrap="none",
+            font=("Consolas", 9),
+        )
+        scroll = ttk.Scrollbar(self.log_panel, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scroll.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=6)
+        scroll.grid(row=0, column=1, sticky="ns", pady=6)
+        self.log_panel.rowconfigure(0, weight=1)
+        self.log_panel.columnconfigure(0, weight=1)
+        for tag, color in (("info", "#333333"), ("ok", "#0a7d32"), ("err", "#c0262c")):
+            self.log_text.tag_configure(tag, foreground=color)
+
+        # 状态栏
+        self.status_plugins = ttk.Label(self.status_bar, text="插件：-")
+        self.status_plugins.pack(side="left")
+        self.status_job = ttk.Label(self.status_bar, text="就绪")
+        self.status_job.pack(side="right")
+
+    def _form_frame(self, parent: ttk.Notebook, title: str) -> ttk.Frame:
+        page = ttk.Frame(parent, padding=16)
+        parent.add(page, text=title)
+        page.columnconfigure(1, weight=1)
+        return page
+
+    def _row(self, page: ttk.Frame, row: int, label: str) -> ttk.Frame:
+        ttk.Label(page, text=label).grid(row=row, column=0, sticky="e", padx=(0, 8), pady=5)
+        holder = ttk.Frame(page)
+        holder.grid(row=row, column=1, columnspan=2, sticky="ew")
+        holder.columnconfigure(0, weight=1)
+        return holder
+
+    def _build_widgets(self) -> None:
+        self._build_encrypt_page()
+        self._build_decrypt_page()
+        self._build_plugins_page()
+
+    def _build_encrypt_page(self) -> None:
+        page = self._form_frame(self.notebook, "加密")
+        self.enc_page = page
+
+        ttk.Label(page, text="加密方式").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=5)
+        self.enc_plugin_var = tk.StringVar()
+        self.enc_plugin_combo = ttk.Combobox(page, textvariable=self.enc_plugin_var, state="readonly")
+        self.enc_plugin_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
+        self.enc_plugin_combo.bind("<<ComboboxSelected>>", lambda e: self._on_plugin_selected(encrypt=True))
+        self.enc_desc_label = ttk.Label(page, text="", wraplength=560, foreground="#555555")
+        self.enc_desc_label.grid(row=1, column=1, columnspan=2, sticky="w", pady=(0, 6))
+
+        holder = self._row(page, 2, "待加密文件")
+        self.enc_src_var = tk.StringVar()
+        self.enc_src_entry = ttk.Entry(holder, textvariable=self.enc_src_var)
+        self.enc_src_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(holder, text="浏览…", width=8, command=self._pick_encrypt_source).grid(row=0, column=1, padx=(6, 0))
+
+        holder = self._row(page, 3, "加密后保存为")
+        self.enc_dst_var = tk.StringVar()
+        self.enc_dst_entry = ttk.Entry(holder, textvariable=self.enc_dst_var)
+        self.enc_dst_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(holder, text="浏览…", width=8, command=self._pick_encrypt_dest).grid(row=0, column=1, padx=(6, 0))
+
+        holder = self._row(page, 4, "密码")
+        self.enc_pwd_var = tk.StringVar()
+        self.enc_pwd_entry = ttk.Entry(holder, textvariable=self.enc_pwd_var, show="●")
+        self.enc_pwd_entry.grid(row=0, column=0, sticky="ew")
+        holder = self._row(page, 5, "确认密码")
+        self.enc_pwd2_var = tk.StringVar()
+        self.enc_pwd2_entry = ttk.Entry(holder, textvariable=self.enc_pwd2_var, show="●")
+        self.enc_pwd2_entry.grid(row=0, column=0, sticky="ew")
+        self.enc_pwd_row = 4  # 记录行号，隐藏/恢复密码框时用
+
+        self._build_progress_area(page, 6, encrypt=True)
+        holder = ttk.Frame(page)
+        holder.grid(row=7, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        self.enc_start_btn = ttk.Button(holder, text="开始加密", command=lambda: self._start_job(encrypt=True))
+        self.enc_start_btn.pack(side="left")
+
+    def _build_decrypt_page(self) -> None:
+        page = self._form_frame(self.notebook, "解密")
+        self.dec_page = page
+
+        ttk.Label(page, text="解密方式").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=5)
+        self.dec_plugin_var = tk.StringVar()
+        self.dec_plugin_combo = ttk.Combobox(page, textvariable=self.dec_plugin_var, state="readonly")
+        self.dec_plugin_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
+        self.dec_plugin_combo.bind("<<ComboboxSelected>>", lambda e: self._on_plugin_selected(encrypt=False))
+        ttk.Label(
+            page, text="选择文件后会按文件头自动识别，通常无需手动修改",
+            foreground="#555555",
+        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=(0, 6))
+        self.dec_desc_label = ttk.Label(page, text="", wraplength=560, foreground="#555555")
+        self.dec_desc_label.grid(row=2, column=1, columnspan=2, sticky="w", pady=(0, 6))
+
+        holder = self._row(page, 3, "待解密文件")
+        self.dec_src_var = tk.StringVar()
+        self.dec_src_entry = ttk.Entry(holder, textvariable=self.dec_src_var)
+        self.dec_src_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(holder, text="浏览…", width=8, command=self._pick_decrypt_source).grid(row=0, column=1, padx=(6, 0))
+
+        holder = self._row(page, 4, "解密后保存为")
+        self.dec_dst_var = tk.StringVar()
+        self.dec_dst_entry = ttk.Entry(holder, textvariable=self.dec_dst_var)
+        self.dec_dst_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(holder, text="浏览…", width=8, command=self._pick_decrypt_dest).grid(row=0, column=1, padx=(6, 0))
+
+        holder = self._row(page, 5, "密码")
+        self.dec_pwd_var = tk.StringVar()
+        self.dec_pwd_entry = ttk.Entry(holder, textvariable=self.dec_pwd_var, show="●")
+        self.dec_pwd_entry.grid(row=0, column=0, sticky="ew")
+        self.dec_pwd_row = 5
+
+        self._build_progress_area(page, 6, encrypt=False)
+        holder = ttk.Frame(page)
+        holder.grid(row=7, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        self.dec_start_btn = ttk.Button(holder, text="开始解密", command=lambda: self._start_job(encrypt=False))
+        self.dec_start_btn.pack(side="left")
+
+    def _build_progress_area(self, page: ttk.Frame, row: int, encrypt: bool) -> None:
+        holder = ttk.Frame(page)
+        holder.grid(row=row, column=1, columnspan=2, sticky="ew", pady=(12, 0))
+        holder.columnconfigure(0, weight=1)
+        bar = ttk.Progressbar(holder, mode="determinate", maximum=100)
+        bar.grid(row=0, column=0, sticky="ew")
+        pct = ttk.Label(holder, text="0%", width=6, anchor="e")
+        pct.grid(row=0, column=1, padx=(8, 0))
+        cancel = ttk.Button(holder, text="取消", width=6, command=self._cancel_job)
+        cancel.grid(row=0, column=2, padx=(8, 0))
+        if encrypt:
+            self.enc_bar, self.enc_bar_pct, self.enc_cancel_btn = bar, pct, cancel
+        else:
+            self.dec_bar, self.dec_bar_pct, self.dec_cancel_btn = bar, pct, cancel
+        cancel.config(state="disabled")
+
+    def _cancel_job(self) -> None:
+        if self._cancel_flag is not None:
+            self._cancel_flag.set()
+            self.log("正在取消…", "info")
+
+    def _build_plugins_page(self) -> None:
+        page = ttk.Frame(self.notebook, padding=16)
+        self.notebook.add(page, text="插件")
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=1)
+
+        columns = ("state", "name", "pid", "version", "author", "desc")
+        self.plugin_tree = ttk.Treeview(page, columns=columns, show="headings", height=12)
+        headers = {
+            "state": ("状态", 80, "center"),
+            "name": ("名称", 170, "w"),
+            "pid": ("插件 ID", 130, "w"),
+            "version": ("版本", 70, "center"),
+            "author": ("作者", 130, "w"),
+            "desc": ("说明", 320, "w"),
+        }
+        for col, (text, width, anchor) in headers.items():
+            self.plugin_tree.heading(col, text=text)
+            self.plugin_tree.column(col, width=width, anchor=anchor, stretch=(col == "desc"))
+        self.plugin_tree.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(page, orient="vertical", command=self.plugin_tree.yview)
+        self.plugin_tree.configure(yscrollcommand=scroll.set)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.plugin_tree.bind("<Double-1>", self._show_plugin_detail)
+
+        btns = ttk.Frame(page)
+        btns.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Button(btns, text="重新扫描插件", command=lambda: self.reload_plugins()).pack(side="left")
+        ttk.Button(btns, text="打开插件目录", command=self._open_plugins_dir).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="插件开发指南", command=self._open_plugin_doc).pack(side="left", padx=(8, 0))
+
+    # ------------------------------------------------------------------
+    # 插件管理
+    # ------------------------------------------------------------------
+
+    def reload_plugins(self, quiet: bool = False) -> None:
+        previous_enc = self._selected_plugin_id(encrypt=True)
+        previous_dec = self._selected_plugin_id(encrypt=False)
+        self.registry = plugin_manager.scan_plugins()
+        names = [item.display_name for item in self.registry.loaded]
+        for combo, var, prev in (
+            (self.enc_plugin_combo, self.enc_plugin_var, previous_enc),
+            (self.dec_plugin_combo, self.dec_plugin_var, previous_dec),
+        ):
+            combo["values"] = names
+            var.set("")
+            if prev:
+                for item in self.registry.loaded:
+                    if item.id == prev:
+                        var.set(item.display_name)
+            if not var.get() and names:
+                var.set(names[0])
+        self._on_plugin_selected(encrypt=True)
+        self._on_plugin_selected(encrypt=False)
+
+        self.plugin_tree.delete(*self.plugin_tree.get_children())
+        for item in self.registry.loaded:
+            p = item.plugin
+            self.plugin_tree.insert("", "end", values=(
+                "可用", p.name, p.id, p.version, p.author or "-", p.description or "-",
+            ), tags=("ok",))
+        for item in self.registry.failed:
+            self.plugin_tree.insert("", "end", values=(
+                "加载失败", item.source.stem, "-", "-", "-", item.reason,
+            ), tags=("err",))
+        self.plugin_tree.tag_configure("ok", foreground="#0a7d32")
+        self.plugin_tree.tag_configure("err", foreground="#c0262c")
+
+        self.status_plugins.config(
+            text=f"插件：{len(self.registry.loaded)} 个可用"
+            + (f"，{len(self.registry.failed)} 个加载失败" if self.registry.failed else "")
+        )
+        if not quiet:
+            self.log(f"已重新扫描插件：{len(self.registry.loaded)} 个可用，{len(self.registry.failed)} 个失败。", "info")
+        for item in self.registry.failed:
+            self.log(f"插件加载失败 {item.source}: {item.reason}", "err")
+
+    def _selected_plugin(self, encrypt: bool):
+        var = self.enc_plugin_var if encrypt else self.dec_plugin_var
+        display = var.get()
+        for item in self.registry.loaded:
+            if item.display_name == display:
+                return item.plugin
+        return None
+
+    def _selected_plugin_id(self, encrypt: bool) -> Optional[str]:
+        p = self._selected_plugin(encrypt)
+        return p.id if p else None
+
+    def _on_plugin_selected(self, encrypt: bool) -> None:
+        plugin = self._selected_plugin(encrypt)
+        page = self.enc_page if encrypt else self.dec_page
+        desc = self.enc_desc_label if encrypt else self.dec_desc_label
+        pwd_row = self.enc_pwd_row if encrypt else self.dec_pwd_row
+        widgets = (
+            [self.enc_pwd_entry, self.enc_pwd2_entry] if encrypt else [self.dec_pwd_entry]
+        )
+        if plugin is None:
+            desc.config(text="")
+            return
+        extra = "" if plugin.requires_password else "（该算法无需密码）"
+        desc.config(text=(plugin.description or "（无描述）") + extra)
+        for w in widgets:
+            if plugin.requires_password:
+                w.grid()
+            else:
+                w.grid_remove()
+
+    def _show_plugin_detail(self, _event=None) -> None:
+        sel = self.plugin_tree.selection()
+        if not sel:
+            return
+        values = self.plugin_tree.item(sel[0], "values")
+        state, name, pid, version, author, desc = values
+        if state == "可用":
+            plugin = self.registry.find(pid)
+            if plugin:
+                msg = (
+                    f"名称：{plugin.name}\n插件 ID：{plugin.id}\n版本：{plugin.version}\n"
+                    f"作者：{plugin.author or '-'}\n需要密码：{'是' if plugin.requires_password else '否'}\n\n"
+                    f"说明：{plugin.description or '-'}\n"
+                )
+                src = self.registry.get(pid)
+                if src:
+                    msg += f"\n源码位置：{src.source}"
+                messagebox.showinfo("插件详情", msg)
+        else:
+            fail = next((f for f in self.registry.failed if f.source.stem == name), None)
+            msg = f"加载失败：{name}\n\n原因：{fail.reason if fail else desc}\n\n源码位置：{fail.source if fail else '-'}"
+            messagebox.showerror("插件详情", msg)
+
+    def _open_plugins_dir(self) -> None:
+        path = plugin_manager.default_plugins_dir()
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]  # Windows
+        except Exception:
+            self.log(f"插件目录：{path}", "info")
+
+    def _open_plugin_doc(self) -> None:
+        doc = Path(__file__).resolve().parent.parent / "docs" / "PLUGIN_DEV.md"
+        if doc.is_file():
+            try:
+                os.startfile(doc)  # type: ignore[attr-defined]
+                return
+            except Exception:
+                pass
+        self.log(f"插件开发指南位置：{doc}", "info")
+
+    # ------------------------------------------------------------------
+    # 文件选择
+    # ------------------------------------------------------------------
+
+    def _pick_encrypt_source(self) -> None:
+        path = filedialog.askopenfilename(title="选择待加密文件", parent=self.root)
+        if not path:
+            return
+        self.enc_src_var.set(path)
+        src = Path(path)
+        self.enc_dst_var.set(str(src.with_name(engine.encrypted_name(src))))
+        self.log(f"已选择待加密文件：{path}", "info")
+
+    def _pick_encrypt_dest(self) -> None:
+        initial = self.enc_dst_var.get() or (self.enc_src_var.get() + ENC_EXTENSION)
+        path = filedialog.asksaveasfilename(
+            title="选择加密文件保存位置",
+            defaultextension=ENC_EXTENSION,
+            filetypes=[("Encryptor 加密文件", f"*{ENC_EXTENSION}"), ("所有文件", "*.*")],
+            initialfile=Path(initial).name if initial else "encrypted",
+            parent=self.root,
+        )
+        if path:
+            self.enc_dst_var.set(path)
+
+    def _pick_decrypt_source(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择待解密文件",
+            filetypes=[("Encryptor 加密文件", f"*{ENC_EXTENSION}"), ("所有文件", "*.*")],
+            parent=self.root,
+        )
+        if not path:
+            return
+        self.dec_src_var.set(path)
+        src = Path(path)
+        self.dec_dst_var.set(str(src.with_name(engine.decrypted_name(src))))
+        # 按文件头自动选择解密插件
+        pid = engine.peek_plugin_id(src)
+        if pid:
+            hit = self.registry.find(pid)
+            if hit:
+                for item in self.registry.loaded:
+                    if item.id == pid:
+                        self.dec_plugin_var.set(item.display_name)
+                        self._on_plugin_selected(encrypt=False)
+                self.log(f"已识别加密算法：{hit.name}（{pid}）", "info")
+            else:
+                self.log(f"该文件由插件 [{pid}] 加密，但当前未加载该插件，请先安装/启用后再解密。", "err")
+        else:
+            self.log("警告：文件头不是有效的 Encryptor 加密格式，无法自动识别算法。", "err")
+        self.log(f"已选择待解密文件：{path}", "info")
+
+    def _pick_decrypt_dest(self) -> None:
+        initial = self.dec_dst_var.get()
+        path = filedialog.asksaveasfilename(
+            title="选择解密文件保存位置",
+            initialfile=Path(initial).name if initial else "decrypted",
+            parent=self.root,
+        )
+        if path:
+            self.dec_dst_var.set(path)
+
+    # ------------------------------------------------------------------
+    # 任务执行
+    # ------------------------------------------------------------------
+
+    def _set_busy(self, busy: bool, job_text: str = "") -> None:
+        self._busy = busy
+        for btn in (self.enc_start_btn, self.dec_start_btn):
+            btn.config(state="disabled" if busy else "normal")
+        for btn in (self.enc_cancel_btn, self.dec_cancel_btn):
+            btn.config(state="normal" if busy else "disabled")
+        self.status_job.config(text=job_text if busy else "就绪")
+        if not busy:
+            self._cancel_flag = None
+
+    def _validate(self, encrypt: bool):
+        src_var = self.enc_src_var if encrypt else self.dec_src_var
+        dst_var = self.enc_dst_var if encrypt else self.dec_dst_var
+        plugin = self._selected_plugin(encrypt)
+        if plugin is None:
+            if not self.registry.loaded:
+                raise PluginError("没有可用的加密插件，请先在『插件』页检查插件加载情况。")
+            raise PluginError("请选择加密/解密方式。")
+        src = Path(src_var.get().strip())
+        if not src_var.get().strip():
+            raise PluginError("请选择待处理文件。")
+        if not src.is_file():
+            raise PluginError(f"文件不存在：{src}")
+        dst = Path(dst_var.get().strip())
+        if not dst_var.get().strip():
+            raise PluginError("请选择输出保存位置。")
+        if dst == src:
+            raise PluginError("输出路径不能与源文件相同。")
+        password = None
+        if plugin.requires_password:
+            pwd_var = self.enc_pwd_var if encrypt else self.dec_pwd_var
+            password = pwd_var.get()
+            if not password:
+                raise PluginError("请输入密码。")
+            if encrypt and password != self.enc_pwd2_var.get():
+                raise PluginError("两次输入的密码不一致。")
+        if dst.exists():
+            ok = messagebox.askyesno(
+                "覆盖确认", f"目标文件已存在，是否覆盖？\n\n{dst}", parent=self.root
+            )
+            if not ok:
+                raise CancelledError("已取消：用户放弃覆盖目标文件。")
+        return plugin, src, dst, password
+
+    def _start_job(self, encrypt: bool) -> None:
+        if self._busy:
+            return
+        try:
+            plugin, src, dst, password = self._validate(encrypt)
+        except CancelledError as exc:
+            self.log(str(exc) or "已取消。", "info")
+            return
+        except PluginError as exc:
+            self.log(str(exc), "err")
+            return
+
+        self._cancel_flag = threading.Event()
+        action = "加密" if encrypt else "解密"
+        self._set_busy(True, f"正在{action}…")
+        bar, pct = (self.enc_bar, self.enc_bar_pct) if encrypt else (self.dec_bar, self.dec_bar_pct)
+        self._active_progress = (bar, pct)
+        bar["value"] = 0
+        pct.config(text="0%")
+        total = src.stat().st_size
+        self.log(
+            f"开始{action}：{src}\n  → {dst}\n  算法：{plugin.name}（{plugin.id} v{plugin.version}）",
+            "info",
+        )
+        self._worker = threading.Thread(
+            target=self._run_job,
+            args=(encrypt, plugin, src, dst, password, total),
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _run_job(self, encrypt, plugin, src, dst, password, total) -> None:
+        q = self._event_queue
+        processed = [0]
+        last_report = [0.0]
+
+        def on_progress(n: int) -> None:
+            processed[0] += n
+            now = time.monotonic()
+            if now - last_report[0] > 0.1 or processed[0] >= total:
+                last_report[0] = now
+                pct = min(100, processed[0] * 100 // total) if total else 100
+                q.put(("progress", pct))
+
+        try:
+            if encrypt:
+                n = engine.encrypt_file(plugin, src, dst, password, on_progress, self._cancel_flag)
+                q.put(("done", True, f"加密完成：{dst}（明文 {n:,} 字节）"))
+            else:
+                n = engine.decrypt_file(
+                    plugin, src, dst, password,
+                    expect_plugin_id=plugin.id,
+                    on_progress=on_progress, cancel=self._cancel_flag,
+                )
+                q.put(("done", True, f"解密完成：{dst}（明文 {n:,} 字节）"))
+        except CancelledError as exc:
+            q.put(("done", False, f"已取消：{exc or '用户取消'}"))
+        except WrongPasswordError as exc:
+            q.put(("done", False, f"密码错误或文件已损坏：{exc}"))
+        except ContainerError as exc:
+            q.put(("done", False, f"文件格式错误：{exc}"))
+        except IntegrityError as exc:
+            q.put(("done", False, f"数据校验失败：{exc}"))
+        except PluginError as exc:
+            q.put(("done", False, f"插件错误：{exc}"))
+        except Exception as exc:
+            detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            q.put(("done", False, f"未知错误（{type(exc).__name__}）：{detail}"))
+
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                event = self._event_queue.get_nowait()
+                kind = event[0]
+                if kind == "progress":
+                    _, percent = event
+                    bar, label = self._active_progress
+                    if bar is not None:
+                        bar["value"] = percent
+                        label.config(text=f"{percent}%")
+                elif kind == "done":
+                    _, ok, message = event
+                    self.log(message, "ok" if ok else "err")
+                    bar, label = self._active_progress
+                    if ok and bar is not None:
+                        bar["value"] = 100
+                        label.config(text="100%")
+                    self._set_busy(False)
+        except queue.Empty:
+            pass
+        self.root.after(80, self._poll_events)
+
+    # ------------------------------------------------------------------
+    # 日志
+    # ------------------------------------------------------------------
+
+    def log(self, message: str, level: str = "info") -> None:
+        stamp = time.strftime("%H:%M:%S")
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", f"[{stamp}] {message}\n", level)
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+
+def main() -> None:
+    root = tk.Tk()
+    EncryptorApp(root)
+    root.mainloop()
