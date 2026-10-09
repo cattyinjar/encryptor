@@ -18,7 +18,7 @@ import hashlib
 import os
 from typing import BinaryIO, Optional
 
-from encryptor.sdk import CryptoPlugin, IntegrityError, ProgressFn
+from encryptor.sdk import CryptoPlugin, IntegrityError, ProgressFn, secure_zero
 
 SALT_LEN = 16
 KEY_LEN = 32
@@ -38,31 +38,38 @@ def _read_exact(src: BinaryIO, n: int) -> bytes:
 
 
 def _xor_stream(key: bytes, salt: bytes, src: BinaryIO, dst: BinaryIO, on_progress: ProgressFn) -> None:
-    """加解密共用：把 src 与 SHA-256 计数器密钥流异或后写入 dst。"""
+    """加解密共用：把 src 与 SHA-256 计数器密钥流异或后写入 dst。
+
+    每个密钥流块用完即清零（密钥流由密钥派生，属敏感材料）。
+    """
     block_index = 0
     offset_in_block = 0
     keystream = b""
-    while True:
-        chunk = _read_exact(src, CHUNK_SIZE)
-        if not chunk:
-            break
-        out = bytearray(len(chunk))
-        pos = 0
-        while pos < len(chunk):
-            if offset_in_block == 0:
-                counter = block_index.to_bytes(8, "big")
-                keystream = hashlib.sha256(key + salt + counter).digest()
-            take = min(KEYSTREAM_BLOCK - offset_in_block, len(chunk) - pos)
-            out[pos : pos + take] = (
-                b ^ k for b, k in zip(chunk[pos : pos + take], keystream[offset_in_block : offset_in_block + take])
-            )
-            pos += take
-            offset_in_block += take
-            if offset_in_block == KEYSTREAM_BLOCK:
-                offset_in_block = 0
-                block_index += 1
-        dst.write(out)
-        on_progress(len(chunk))
+    try:
+        while True:
+            chunk = _read_exact(src, CHUNK_SIZE)
+            if not chunk:
+                break
+            out = bytearray(len(chunk))
+            pos = 0
+            while pos < len(chunk):
+                if offset_in_block == 0:
+                    secure_zero(keystream)  # 上一块用完即清零
+                    counter = block_index.to_bytes(8, "big")
+                    keystream = hashlib.sha256(key + salt + counter).digest()
+                take = min(KEYSTREAM_BLOCK - offset_in_block, len(chunk) - pos)
+                out[pos : pos + take] = (
+                    b ^ k for b, k in zip(chunk[pos : pos + take], keystream[offset_in_block : offset_in_block + take])
+                )
+                pos += take
+                offset_in_block += take
+                if offset_in_block == KEYSTREAM_BLOCK:
+                    offset_in_block = 0
+                    block_index += 1
+            dst.write(out)
+            on_progress(len(chunk))
+    finally:
+        secure_zero(keystream)
 
 
 class Plugin(CryptoPlugin):
@@ -81,8 +88,11 @@ class Plugin(CryptoPlugin):
     ) -> bytes:
         salt = os.urandom(SALT_LEN)
         key = self.derive_key(password or "", salt, KEY_LEN, ROUNDS)
-        _xor_stream(key, salt, src, dst, on_progress)
-        return salt
+        try:
+            _xor_stream(key, salt, src, dst, on_progress)
+            return salt
+        finally:
+            secure_zero(key)
 
     def decrypt_stream(
         self,
@@ -96,5 +106,8 @@ class Plugin(CryptoPlugin):
             raise IntegrityError("元数据长度不正确，文件可能已损坏")
         salt = metadata
         key = self.derive_key(password or "", salt, KEY_LEN, ROUNDS)
-        # XOR 对称，解密与加密是同一过程
-        _xor_stream(key, salt, src, dst, on_progress)
+        try:
+            # XOR 对称，解密与加密是同一过程
+            _xor_stream(key, salt, src, dst, on_progress)
+        finally:
+            secure_zero(key)

@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from encryptor import engine, plugin_manager
 from encryptor.container import ContainerError
-from encryptor.sdk import IntegrityError, WrongPasswordError
+from encryptor.sdk import IntegrityError, PluginError, WrongPasswordError
 
 PASS = 0
 FAIL = 0
@@ -154,6 +154,191 @@ def main() -> int:
             p.name for p in tmp.iterdir() if p.name in ("t1.out", "t2.out", "t3.out", "t4.out")
         ]
         check("失败任务无残留输出", not leftovers, str(leftovers))
+
+        # ---------- 密钥文件插件（RSA / ECC 混合加密） ----------
+        print("== 密钥文件插件：RSA / ECC ==")
+        rsa_p = reg.find("rsa-oaep-aes256gcm")
+        ecc_p = reg.find("ecdh-aes256gcm")
+        check("RSA 插件加载成功", rsa_p is not None, str(loaded_ids))
+        check("ECC 插件加载成功", ecc_p is not None, str(loaded_ids))
+
+        keys_dir = tmp / "keys"
+        rsa_pub, rsa_priv = rsa_p.generate_keypair(keys_dir)
+        ecc_pub, ecc_priv = ecc_p.generate_keypair(keys_dir)
+        check("RSA 密钥对生成", rsa_pub.is_file() and rsa_priv.is_file())
+        check("ECC 密钥对生成", ecc_pub.is_file() and ecc_priv.is_file())
+        check("RSA 公钥为标准 PEM", b"BEGIN PUBLIC KEY" in rsa_pub.read_bytes())
+        check("ECC 私钥为标准 PEM", b"PRIVATE KEY" in ecc_priv.read_bytes())
+        check("重复生成同目录密钥被拒绝",
+              expect_raises(PluginError, rsa_p.generate_keypair, keys_dir))
+
+        for plugin, pub, priv in (
+            (rsa_p, rsa_pub, rsa_priv),
+            (ecc_p, ecc_pub, ecc_priv),
+        ):
+            for name, src in samples.items():
+                enc_k = tmp / f"{name}.{plugin.id}.encx"
+                dec_k = tmp / f"{name}.{plugin.id}.out"
+                engine.encrypt_file(plugin, src, enc_k, str(pub))
+                engine.decrypt_file(plugin, enc_k, dec_k, str(priv))
+                check(f"{plugin.id} {name} 密钥文件往返一致", md5(dec_k) == md5(src))
+            head = engine.peek_plugin_id(tmp / f"text.txt.{plugin.id}.encx")
+            check(f"{plugin.id} 文件头记录算法 id", head == plugin.id, str(head))
+
+        enc_rsa = tmp / f"text.txt.{rsa_p.id}.encx"
+        enc_ecc = tmp / f"text.txt.{ecc_p.id}.encx"
+
+        # 错误私钥（另一对密钥）
+        keys2 = tmp / "keys2"
+        _, rsa_priv2 = rsa_p.generate_keypair(keys2)
+        _, ecc_priv2 = ecc_p.generate_keypair(keys2)
+        check("RSA 错误私钥被拒绝",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            rsa_p, enc_rsa, tmp / "wrong1.out", str(rsa_priv2)))
+        check("ECC 错误私钥被拒绝",
+              expect_raises((WrongPasswordError, IntegrityError), engine.decrypt_file,
+                            ecc_p, enc_ecc, tmp / "wrong2.out", str(ecc_priv2)))
+
+        # 跨算法 / 跨密钥类型混用
+        check("ECC 密文不能由 RSA 插件解（容器层拦截）",
+              expect_raises(ContainerError, engine.decrypt_file,
+                            rsa_p, enc_ecc, tmp / "x1.out", str(rsa_priv)))
+        check("RSA 解密配 ECC 私钥被拒绝",
+              expect_raises(PluginError, engine.decrypt_file,
+                            rsa_p, enc_rsa, tmp / "x2.out", str(ecc_priv)))
+
+        # 密钥文件缺失
+        check("加密时密钥文件缺失被拒绝",
+              expect_raises(PluginError, engine.encrypt_file,
+                            rsa_p, samples["text.txt"], tmp / "x3.encx", str(tmp / "nope.pem")))
+
+        # 篡改元数据尾部
+        tampered_k = tmp / "tampered_k.encx"
+        raw_k = bytearray(enc_ecc.read_bytes())
+        raw_k[len(raw_k) - 30] ^= 0xFF  # 落在元数据区域
+        tampered_k.write_bytes(raw_k)
+        check("ECC 元数据篡改被检测",
+              expect_raises((WrongPasswordError, IntegrityError, ContainerError),
+                            engine.decrypt_file, ecc_p, tampered_k, tmp / "x4.out", str(ecc_priv)))
+
+        leftovers2 = [p.name for p in tmp.glob("*.part")] + [
+            p.name for p in tmp.iterdir()
+            if p.name.startswith(("x1", "x2", "x3", "x4", "wrong1", "wrong2"))
+        ]
+        check("密钥插件失败任务无残留输出", not leftovers2, str(leftovers2))
+
+        # ---------- 带口令的私钥 ----------
+        print("== 带口令的私钥 ==")
+        pub_e, priv_e = rsa_p.generate_keypair(tmp / "keys_enc", passphrase="top-secret-PW")
+        check("口令私钥为标准加密 PEM", b"BEGIN ENCRYPTED PRIVATE KEY" in priv_e.read_bytes())
+        check("口令私钥对的公钥仍为明文 PEM", b"BEGIN PUBLIC KEY" in pub_e.read_bytes())
+        enc_pw = tmp / "text.txt.rsa-pw.encx"
+        dec_pw = tmp / "text.txt.rsa-pw.out"
+        engine.encrypt_file(rsa_p, samples["text.txt"], enc_pw, str(pub_e))  # 公钥无需口令
+        engine.decrypt_file(rsa_p, enc_pw, dec_pw, str(priv_e), passphrase="top-secret-PW")
+        check("RSA 口令私钥往返一致", dec_pw.read_bytes() == samples["text.txt"].read_bytes())
+        check("错误口令被拒绝",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            rsa_p, enc_pw, tmp / "w3.out", str(priv_e), passphrase="wrong"))
+        check("未给口令时给出明确提示",
+              expect_raises(PluginError, engine.decrypt_file,
+                            rsa_p, enc_pw, tmp / "w4.out", str(priv_e)))
+        dec_ok = tmp / "text.txt.plain-with-pw.out"
+        engine.decrypt_file(rsa_p, enc_rsa, dec_ok, str(rsa_priv), passphrase="多输的口令")
+        check("明文私钥误配口令仍可解密", dec_ok.read_bytes() == samples["text.txt"].read_bytes())
+
+        e_pub, e_priv = ecc_p.generate_keypair(tmp / "keys_enc2", passphrase="ecc-pw")
+        e_enc = tmp / "text.txt.ecc-pw.encx"
+        e_dec = tmp / "text.txt.ecc-pw.out"
+        engine.encrypt_file(ecc_p, samples["text.txt"], e_enc, str(e_pub))
+        engine.decrypt_file(ecc_p, e_enc, e_dec, str(e_priv), passphrase="ecc-pw")
+        check("ECC 口令私钥往返一致", e_dec.read_bytes() == samples["text.txt"].read_bytes())
+        check("ECC 错误口令被拒绝",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            ecc_p, e_enc, tmp / "w5.out", str(e_priv), passphrase="no"))
+        leftovers3 = [p.name for p in tmp.iterdir() if p.name.startswith(("w3", "w4", "w5"))]
+        check("口令失败任务无残留输出", not leftovers3, str(leftovers3))
+
+        # ---------- 国密插件（SM2 / SM3 / SM4） ----------
+        print("== 国密插件：SM2 / SM3 / SM4 ==")
+        sm3p = reg.find("sm3-stream")
+        sm4p = reg.find("sm4-gcm")
+        sm2p = reg.find("sm2-sm4-gcm")
+        check("SM3 插件加载成功", sm3p is not None, str(loaded_ids))
+        check("SM4 插件加载成功", sm4p is not None, str(loaded_ids))
+        check("SM2 插件加载成功", sm2p is not None, str(loaded_ids))
+
+        for plugin in (sm3p, sm4p):
+            for name, src in samples.items():
+                enc_k = tmp / f"{name}.{plugin.id}.encx"
+                dec_k = tmp / f"{name}.{plugin.id}.out"
+                engine.encrypt_file(plugin, src, enc_k, "国密-pw-123")
+                engine.decrypt_file(plugin, enc_k, dec_k, "国密-pw-123")
+                check(f"{plugin.id} {name} 往返一致", md5(dec_k) == md5(src))
+        check("SM4 错密码被拒绝",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            sm4p, tmp / f"text.txt.{sm4p.id}.encx", tmp / "w6.out", "wrong"))
+
+        s_pub, s_priv = sm2p.generate_keypair(tmp / "keys_sm2", passphrase="sm2-pw")
+        check("SM2 公钥文件标记正确", b"BEGIN SM2 PUBLIC KEY" in s_pub.read_bytes())
+        check("SM2 口令私钥为加密信封", b"ENCRYPTED SM2 PRIVATE KEY" in s_priv.read_bytes())
+        s_pub2, s_priv2 = sm2p.generate_keypair(tmp / "keys_sm2_plain")
+        check("SM2 明文私钥标记正确", b"BEGIN SM2 PRIVATE KEY" in s_priv2.read_bytes())
+        for name, src in samples.items():
+            enc_k = tmp / f"{name}.sm2.encx"
+            dec_k = tmp / f"{name}.sm2.out"
+            engine.encrypt_file(sm2p, src, enc_k, str(s_pub))
+            engine.decrypt_file(sm2p, enc_k, dec_k, str(s_priv), passphrase="sm2-pw")
+            check(f"sm2 {name} 往返一致", md5(dec_k) == md5(src))
+        enc_sm2 = tmp / "text.txt.sm2.encx"
+        check("SM2 空文件错误私钥被拒绝（CEK 校验生效）",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            sm2p, tmp / "empty.bin.sm2.encx", tmp / "w7.out", str(s_priv2)))
+        check("SM2 错误私钥被拒绝",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            sm2p, enc_sm2, tmp / "w8.out", str(s_priv2), passphrase=None))
+        check("SM2 缺口令被提示",
+              expect_raises(PluginError, engine.decrypt_file,
+                            sm2p, enc_sm2, tmp / "w9.out", str(s_priv)))
+        check("SM2 错误口令被拒绝",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            sm2p, enc_sm2, tmp / "w10.out", str(s_priv), passphrase="wrong"))
+        check("SM2 密文不能由 SM4 插件解（容器层拦截）",
+              expect_raises(ContainerError, engine.decrypt_file,
+                            sm4p, enc_sm2, tmp / "w11.out", "x"))
+        leftovers4 = [p.name for p in tmp.iterdir()
+                      if p.name.startswith(("w6", "w7", "w8", "w9", "w10", "w11"))]
+        check("国密失败任务无残留输出", not leftovers4, str(leftovers4))
+
+        # ---------- 密钥强度下限 ----------
+        print("== 密钥强度下限 ==")
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec as c_ec
+        from cryptography.hazmat.primitives.asymmetric import rsa as c_rsa
+
+        weak_rsa = tmp / "weak_rsa1024.pub.pem"
+        weak_rsa.write_bytes(
+            c_rsa.generate_private_key(public_exponent=65537, key_size=1024)
+            .public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        )
+        check("RSA-1024 公钥被拒绝",
+              expect_raises(PluginError, engine.encrypt_file,
+                            rsa_p, samples["text.txt"], tmp / "weak.encx", str(weak_rsa)))
+        weak_ec = tmp / "weak_p192.pub.pem"
+        weak_ec.write_bytes(
+            c_ec.generate_private_key(c_ec.SECP192R1())
+            .public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+        )
+        check("P-192 公钥被拒绝",
+              expect_raises(PluginError, engine.encrypt_file,
+                            ecc_p, samples["text.txt"], tmp / "weak2.encx", str(weak_ec)))
+        check("强度描述-RSA", "3072" in rsa_p.describe_credential(str(rsa_priv)),
+              rsa_p.describe_credential(str(rsa_priv)))
+        check("强度描述-ECC", "256" in ecc_p.describe_credential(str(ecc_priv)),
+              ecc_p.describe_credential(str(ecc_priv)))
+        check("强度描述-SM2", "SM2" in sm2p.describe_credential(str(s_pub)))
 
         # ---------- 单文件插件形式 ----------
         print("== 单文件插件形式 ==")

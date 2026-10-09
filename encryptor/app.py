@@ -25,6 +25,102 @@ APP_TITLE = f"Encryptor 单机加密解密工具 v{__version__}"
 GEOMETRY = "820x640"
 
 
+class KeygenDialog(tk.Toplevel):
+    """生成密钥对子窗口：选择保存目录，并可选择是否为私钥设置口令。
+
+    模态对话框。关闭后 ``result`` 为 ``(目录, 口令或 None)``，取消时为 None。
+    """
+
+    def __init__(self, root: tk.Tk, plugin) -> None:
+        super().__init__(root)
+        self.title(f"生成密钥对 — {plugin.name}")
+        self.resizable(False, False)
+        self.result = None
+        self.transient(root)
+
+        body = ttk.Frame(self, padding=16)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+
+        ttk.Label(body, text="保存目录").grid(row=0, column=0, sticky="w")
+        dir_holder = ttk.Frame(body)
+        dir_holder.grid(row=1, column=0, sticky="ew", pady=(2, 10))
+        dir_holder.columnconfigure(0, weight=1)
+        self.dir_var = tk.StringVar()
+        ttk.Entry(dir_holder, textvariable=self.dir_var).grid(row=0, column=0, sticky="ew")
+        ttk.Button(dir_holder, text="浏览…", width=8, command=self._pick_dir).grid(
+            row=0, column=1, padx=(6, 0))
+
+        self.use_pass_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            body, text="为私钥文件设置口令保护（推荐）", variable=self.use_pass_var,
+            command=self._sync_pass_state,
+        ).grid(row=2, column=0, sticky="w", pady=(0, 4))
+
+        self.pwd_var = tk.StringVar()
+        self.pwd2_var = tk.StringVar()
+        ttk.Label(body, text="口令").grid(row=3, column=0, sticky="w")
+        self.pwd_entry = ttk.Entry(body, textvariable=self.pwd_var, show="●", width=44)
+        self.pwd_entry.grid(row=4, column=0, sticky="w", pady=(2, 4))
+        ttk.Label(body, text="确认口令").grid(row=5, column=0, sticky="w")
+        self.pwd2_entry = ttk.Entry(body, textvariable=self.pwd2_var, show="●", width=44)
+        self.pwd2_entry.grid(row=6, column=0, sticky="w", pady=(2, 4))
+        ttk.Label(
+            body, foreground="#555555", wraplength=360,
+            text="口令只保护私钥文件本身；公钥不需要口令。"
+                 "请牢记口令——口令丢失则私钥永久无法使用。",
+        ).grid(row=7, column=0, sticky="w", pady=(6, 12))
+
+        btns = ttk.Frame(body)
+        btns.grid(row=8, column=0, sticky="e")
+        ttk.Button(btns, text="生成", command=self._ok).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="取消", command=self._cancel).pack(side="left")
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._sync_pass_state()
+        self.grab_set()
+        self.pwd_entry.focus_set()
+
+    def _pick_dir(self) -> None:
+        path = filedialog.askdirectory(title="选择密钥对保存目录", parent=self)
+        if path:
+            self.dir_var.set(path)
+
+    def _sync_pass_state(self) -> None:
+        state = "normal" if self.use_pass_var.get() else "disabled"
+        for w in (self.pwd_entry, self.pwd2_entry):
+            w.configure(state=state)
+
+    def _validate_and_collect(self):
+        dest = self.dir_var.get().strip()
+        if not dest:
+            messagebox.showwarning("缺少目录", "请先选择密钥对保存目录。", parent=self)
+            return None
+        if not Path(dest).is_dir():
+            messagebox.showwarning("目录无效", f"目录不存在：\n{dest}", parent=self)
+            return None
+        if self.use_pass_var.get():
+            p1, p2 = self.pwd_var.get(), self.pwd2_var.get()
+            if not p1:
+                messagebox.showwarning("缺少口令", "请输入私钥保护口令，或取消勾选口令保护。", parent=self)
+                return None
+            if p1 != p2:
+                messagebox.showwarning("口令不一致", "两次输入的口令不一致。", parent=self)
+                return None
+            return dest, p1
+        return dest, None
+
+    def _ok(self) -> None:
+        collected = self._validate_and_collect()
+        if collected is not None:
+            self.result = collected
+            self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
 class EncryptorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -95,12 +191,14 @@ class EncryptorApp:
         page.columnconfigure(1, weight=1)
         return page
 
-    def _row(self, page: ttk.Frame, row: int, label: str) -> ttk.Frame:
-        ttk.Label(page, text=label).grid(row=row, column=0, sticky="e", padx=(0, 8), pady=5)
+    def _row(self, page: ttk.Frame, row: int, label: str):
+        """创建 [标签 | 内容行] 布局，返回 (内容行容器, 标签控件)。"""
+        label_widget = ttk.Label(page, text=label)
+        label_widget.grid(row=row, column=0, sticky="e", padx=(0, 8), pady=5)
         holder = ttk.Frame(page)
         holder.grid(row=row, column=1, columnspan=2, sticky="ew")
         holder.columnconfigure(0, weight=1)
-        return holder
+        return holder, label_widget
 
     def _build_widgets(self) -> None:
         self._build_encrypt_page()
@@ -119,33 +217,40 @@ class EncryptorApp:
         self.enc_desc_label = ttk.Label(page, text="", wraplength=560, foreground="#555555")
         self.enc_desc_label.grid(row=1, column=1, columnspan=2, sticky="w", pady=(0, 6))
 
-        holder = self._row(page, 2, "待加密文件")
+        holder, _ = self._row(page, 2, "待加密文件")
         self.enc_src_var = tk.StringVar()
         self.enc_src_entry = ttk.Entry(holder, textvariable=self.enc_src_var)
         self.enc_src_entry.grid(row=0, column=0, sticky="ew")
         ttk.Button(holder, text="浏览…", width=8, command=self._pick_encrypt_source).grid(row=0, column=1, padx=(6, 0))
 
-        holder = self._row(page, 3, "加密后保存为")
+        holder, _ = self._row(page, 3, "加密后保存为")
         self.enc_dst_var = tk.StringVar()
         self.enc_dst_entry = ttk.Entry(holder, textvariable=self.enc_dst_var)
         self.enc_dst_entry.grid(row=0, column=0, sticky="ew")
         ttk.Button(holder, text="浏览…", width=8, command=self._pick_encrypt_dest).grid(row=0, column=1, padx=(6, 0))
 
-        holder = self._row(page, 4, "密码")
+        holder, self.enc_pwd_label = self._row(page, 4, "密码")
+        self.enc_pwd_holder = holder
         self.enc_pwd_var = tk.StringVar()
         self.enc_pwd_entry = ttk.Entry(holder, textvariable=self.enc_pwd_var, show="●")
         self.enc_pwd_entry.grid(row=0, column=0, sticky="ew")
-        holder = self._row(page, 5, "确认密码")
+        # 密钥文件模式下显示的"选择密钥"按钮；是否布局由 _on_plugin_selected 决定
+        self.enc_credential_browse = ttk.Button(
+            holder, text="选择…", width=8, command=lambda: self._pick_credential_file(encrypt=True)
+        )
+        holder, self.enc_confirm_label = self._row(page, 5, "确认密码")
+        self.enc_confirm_holder = holder
         self.enc_pwd2_var = tk.StringVar()
         self.enc_pwd2_entry = ttk.Entry(holder, textvariable=self.enc_pwd2_var, show="●")
         self.enc_pwd2_entry.grid(row=0, column=0, sticky="ew")
-        self.enc_pwd_row = 4  # 记录行号，隐藏/恢复密码框时用
 
         self._build_progress_area(page, 6, encrypt=True)
         holder = ttk.Frame(page)
         holder.grid(row=7, column=1, columnspan=2, sticky="w", pady=(10, 0))
         self.enc_start_btn = ttk.Button(holder, text="开始加密", command=lambda: self._start_job(encrypt=True))
         self.enc_start_btn.pack(side="left")
+        # 密钥文件插件（supports_keygen）显示的"生成密钥对"按钮
+        self.enc_keygen_btn = ttk.Button(holder, text="生成密钥对…", command=self._generate_keypair)
 
     def _build_decrypt_page(self) -> None:
         page = self._form_frame(self.notebook, "解密")
@@ -163,27 +268,36 @@ class EncryptorApp:
         self.dec_desc_label = ttk.Label(page, text="", wraplength=560, foreground="#555555")
         self.dec_desc_label.grid(row=2, column=1, columnspan=2, sticky="w", pady=(0, 6))
 
-        holder = self._row(page, 3, "待解密文件")
+        holder, _ = self._row(page, 3, "待解密文件")
         self.dec_src_var = tk.StringVar()
         self.dec_src_entry = ttk.Entry(holder, textvariable=self.dec_src_var)
         self.dec_src_entry.grid(row=0, column=0, sticky="ew")
         ttk.Button(holder, text="浏览…", width=8, command=self._pick_decrypt_source).grid(row=0, column=1, padx=(6, 0))
 
-        holder = self._row(page, 4, "解密后保存为")
+        holder, _ = self._row(page, 4, "解密后保存为")
         self.dec_dst_var = tk.StringVar()
         self.dec_dst_entry = ttk.Entry(holder, textvariable=self.dec_dst_var)
         self.dec_dst_entry.grid(row=0, column=0, sticky="ew")
         ttk.Button(holder, text="浏览…", width=8, command=self._pick_decrypt_dest).grid(row=0, column=1, padx=(6, 0))
 
-        holder = self._row(page, 5, "密码")
+        holder, self.dec_pwd_label = self._row(page, 5, "密码")
         self.dec_pwd_var = tk.StringVar()
         self.dec_pwd_entry = ttk.Entry(holder, textvariable=self.dec_pwd_var, show="●")
         self.dec_pwd_entry.grid(row=0, column=0, sticky="ew")
-        self.dec_pwd_row = 5
+        self.dec_credential_browse = ttk.Button(
+            holder, text="选择…", width=8, command=lambda: self._pick_credential_file(encrypt=False)
+        )
 
-        self._build_progress_area(page, 6, encrypt=False)
+        # 密钥文件的口令框：仅声明 keyfile_needs_passphrase 的插件显示（如加密私钥）
+        holder, self.dec_keypwd_label = self._row(page, 6, "口令")
+        self.dec_keypwd_holder = holder
+        self.dec_keypwd_var = tk.StringVar()
+        self.dec_keypwd_entry = ttk.Entry(holder, textvariable=self.dec_keypwd_var, show="●")
+        self.dec_keypwd_entry.grid(row=0, column=0, sticky="ew")
+
+        self._build_progress_area(page, 7, encrypt=False)
         holder = ttk.Frame(page)
-        holder.grid(row=7, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        holder.grid(row=8, column=1, columnspan=2, sticky="w", pady=(10, 0))
         self.dec_start_btn = ttk.Button(holder, text="开始解密", command=lambda: self._start_job(encrypt=False))
         self.dec_start_btn.pack(side="left")
 
@@ -299,22 +413,66 @@ class EncryptorApp:
 
     def _on_plugin_selected(self, encrypt: bool) -> None:
         plugin = self._selected_plugin(encrypt)
-        page = self.enc_page if encrypt else self.dec_page
-        desc = self.enc_desc_label if encrypt else self.dec_desc_label
-        pwd_row = self.enc_pwd_row if encrypt else self.dec_pwd_row
-        widgets = (
-            [self.enc_pwd_entry, self.enc_pwd2_entry] if encrypt else [self.dec_pwd_entry]
-        )
         if plugin is None:
-            desc.config(text="")
             return
+        desc = self.enc_desc_label if encrypt else self.dec_desc_label
         extra = "" if plugin.requires_password else "（该算法无需密码）"
         desc.config(text=(plugin.description or "（无描述）") + extra)
-        for w in widgets:
+
+        if encrypt:
+            label = self.enc_pwd_label
+            entry = self.enc_pwd_entry
+            browse = self.enc_credential_browse
+            confirm_widgets = (self.enc_confirm_label, self.enc_confirm_holder)
+        else:
+            label = self.dec_pwd_label
+            entry = self.dec_pwd_entry
+            browse = self.dec_credential_browse
+            confirm_widgets = ()
+
+        if getattr(plugin, "credential_mode", "password") == "keyfile":
+            hint = (plugin.encrypt_credential_hint if encrypt else plugin.decrypt_credential_hint) or "密钥文件"
+            label.config(text=hint)
+            entry.configure(show="")
+            browse.grid(row=0, column=1, padx=(6, 0))
+            entry.grid()
+            label.grid()
+        else:
+            label.config(text="密码")
+            entry.configure(show="●")
+            browse.grid_remove()
             if plugin.requires_password:
-                w.grid()
+                entry.grid()
+                label.grid()
             else:
-                w.grid_remove()
+                entry.grid_remove()
+                label.grid_remove()
+
+        # 解密页的密钥文件口令框（加密私钥场景）
+        if not encrypt:
+            show_keypwd = (
+                getattr(plugin, "credential_mode", "password") == "keyfile"
+                and getattr(plugin, "keyfile_needs_passphrase", False)
+            )
+            if show_keypwd:
+                self.dec_keypwd_label.grid()
+                self.dec_keypwd_holder.grid()
+            else:
+                self.dec_keypwd_label.grid_remove()
+                self.dec_keypwd_holder.grid_remove()
+                self.dec_keypwd_var.set("")
+
+        for widget in confirm_widgets:  # 确认密码行只在密码模式且需要密码时出现
+            if getattr(plugin, "credential_mode", "password") == "keyfile" or not plugin.requires_password:
+                widget.grid_remove()
+            else:
+                widget.grid()
+
+        if encrypt:  # "生成密钥对"按钮仅密钥文件插件显示
+            if getattr(plugin, "supports_keygen", False):
+                self.enc_keygen_btn.pack(side="left", padx=(10, 0))
+            else:
+                self.enc_keygen_btn.pack_forget()
 
     def _show_plugin_detail(self, _event=None) -> None:
         sel = self.plugin_tree.selection()
@@ -418,6 +576,40 @@ class EncryptorApp:
         if path:
             self.dec_dst_var.set(path)
 
+    def _pick_credential_file(self, encrypt: bool) -> None:
+        plugin = self._selected_plugin(encrypt)
+        filetypes = getattr(plugin, "credential_filetypes", None) or [("所有文件", "*.*")]
+        title = "选择公钥文件" if encrypt else "选择私钥文件"
+        path = filedialog.askopenfilename(title=title, filetypes=list(filetypes), parent=self.root)
+        if path:
+            (self.enc_pwd_var if encrypt else self.dec_pwd_var).set(path)
+
+    def _generate_keypair(self) -> None:
+        plugin = self._selected_plugin(encrypt=True)
+        if plugin is None:
+            return
+        dialog = KeygenDialog(self.root, plugin)
+        self.root.wait_window(dialog)
+        if dialog.result is None:
+            return
+        dest, passphrase = dialog.result
+        self.root.config(cursor="watch")
+        try:
+            pub_path, priv_path = plugin.generate_keypair(Path(dest), passphrase=passphrase)
+        except Exception as exc:
+            self.log(f"生成密钥对失败：{exc}", "err")
+            messagebox.showerror("生成密钥对失败", str(exc), parent=self.root)
+            return
+        finally:
+            self.root.config(cursor="")
+        self.enc_pwd_var.set(str(pub_path))
+        protection = "口令保护" if passphrase else "无保护（明文私钥，请妥善保管）"
+        self.log(
+            f"已生成密钥对（{plugin.name}，私钥{protection}）：\n  公钥 {pub_path}\n  私钥 {priv_path}\n"
+            f"公钥用于加密、私钥用于解密；私钥路径请妥善保管，公钥路径已自动填入。",
+            "ok",
+        )
+
     # ------------------------------------------------------------------
     # 任务执行
     # ------------------------------------------------------------------
@@ -451,9 +643,21 @@ class EncryptorApp:
         if dst == src:
             raise PluginError("输出路径不能与源文件相同。")
         password = None
-        if plugin.requires_password:
-            pwd_var = self.enc_pwd_var if encrypt else self.dec_pwd_var
-            password = pwd_var.get()
+        passphrase = None
+        mode = getattr(plugin, "credential_mode", "password")
+        cred_var = self.enc_pwd_var if encrypt else self.dec_pwd_var
+        if mode == "keyfile":
+            cred = cred_var.get().strip()
+            if not cred:
+                raise PluginError("请选择密钥文件。")
+            key_path = Path(cred)
+            if not key_path.is_file():
+                raise PluginError(f"密钥文件不存在：{key_path}")
+            password = str(key_path)
+            if not encrypt and getattr(plugin, "keyfile_needs_passphrase", False):
+                passphrase = self.dec_keypwd_var.get() or None
+        elif plugin.requires_password:
+            password = cred_var.get()
             if not password:
                 raise PluginError("请输入密码。")
             if encrypt and password != self.enc_pwd2_var.get():
@@ -464,13 +668,13 @@ class EncryptorApp:
             )
             if not ok:
                 raise CancelledError("已取消：用户放弃覆盖目标文件。")
-        return plugin, src, dst, password
+        return plugin, src, dst, password, passphrase
 
     def _start_job(self, encrypt: bool) -> None:
         if self._busy:
             return
         try:
-            plugin, src, dst, password = self._validate(encrypt)
+            plugin, src, dst, password, passphrase = self._validate(encrypt)
         except CancelledError as exc:
             self.log(str(exc) or "已取消。", "info")
             return
@@ -486,21 +690,27 @@ class EncryptorApp:
         bar["value"] = 0
         pct.config(text="0%")
         total = src.stat().st_size
+        cred_note = (
+            f"\n  密钥文件：{password}" if getattr(plugin, "credential_mode", "password") == "keyfile" else ""
+        )
         self.log(
-            f"开始{action}：{src}\n  → {dst}\n  算法：{plugin.name}（{plugin.id} v{plugin.version}）",
+            f"开始{action}：{src}\n  → {dst}\n  算法：{plugin.name}（{plugin.id} v{plugin.version}）{cred_note}",
             "info",
         )
         self._worker = threading.Thread(
             target=self._run_job,
-            args=(encrypt, plugin, src, dst, password, total),
+            args=(encrypt, plugin, src, dst, password, passphrase, total),
             daemon=True,
         )
         self._worker.start()
 
-    def _run_job(self, encrypt, plugin, src, dst, password, total) -> None:
+    def _run_job(self, encrypt, plugin, src, dst, password, passphrase, total) -> None:
+        from . import securemem
+
         q = self._event_queue
         processed = [0]
         last_report = [0.0]
+        mem_before = securemem.snapshot()
 
         def on_progress(n: int) -> None:
             processed[0] += n
@@ -510,37 +720,58 @@ class EncryptorApp:
                 pct = min(100, processed[0] * 100 // total) if total else 100
                 q.put(("progress", pct))
 
+        def finish(ok: bool, message: str) -> None:
+            delta = securemem.stats_delta(mem_before)
+            note = ""
+            if delta["calls"]:
+                note = f"（敏感内存已清零 {delta['calls']} 处 / {delta['bytes']} 字节，任务结束前同步完成）"
+            q.put(("done", ok, message + note))
+
         try:
+            # 密钥强度等信息由插件描述，写入任务日志（失败静默忽略）
+            describe = getattr(plugin, "describe_credential", None)
+            if callable(describe) and password:
+                try:
+                    note = describe(password, passphrase=passphrase)
+                except Exception:
+                    note = ""
+                if note:
+                    q.put(("log", f"密钥：{note}", "info"))
             if encrypt:
-                n = engine.encrypt_file(plugin, src, dst, password, on_progress, self._cancel_flag)
-                q.put(("done", True, f"加密完成：{dst}（明文 {n:,} 字节）"))
+                n = engine.encrypt_file(plugin, src, dst, password, on_progress,
+                                        self._cancel_flag, passphrase=passphrase)
+                finish(True, f"加密完成：{dst}（明文 {n:,} 字节）")
             else:
                 n = engine.decrypt_file(
                     plugin, src, dst, password,
                     expect_plugin_id=plugin.id,
                     on_progress=on_progress, cancel=self._cancel_flag,
+                    passphrase=passphrase,
                 )
-                q.put(("done", True, f"解密完成：{dst}（明文 {n:,} 字节）"))
+                finish(True, f"解密完成：{dst}（明文 {n:,} 字节）")
         except CancelledError as exc:
-            q.put(("done", False, f"已取消：{exc or '用户取消'}"))
+            finish(False, f"已取消：{exc or '用户取消'}")
         except WrongPasswordError as exc:
-            q.put(("done", False, f"密码错误或文件已损坏：{exc}"))
+            finish(False, f"密码错误或文件已损坏：{exc}")
         except ContainerError as exc:
-            q.put(("done", False, f"文件格式错误：{exc}"))
+            finish(False, f"文件格式错误：{exc}")
         except IntegrityError as exc:
-            q.put(("done", False, f"数据校验失败：{exc}"))
+            finish(False, f"数据校验失败：{exc}")
         except PluginError as exc:
-            q.put(("done", False, f"插件错误：{exc}"))
+            finish(False, f"插件错误：{exc}")
         except Exception as exc:
             detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-            q.put(("done", False, f"未知错误（{type(exc).__name__}）：{detail}"))
+            finish(False, f"未知错误（{type(exc).__name__}）：{detail}")
 
     def _poll_events(self) -> None:
         try:
             while True:
                 event = self._event_queue.get_nowait()
                 kind = event[0]
-                if kind == "progress":
+                if kind == "log":
+                    _, text, level = event
+                    self.log(text, level)
+                elif kind == "progress":
                     _, percent = event
                     bar, label = self._active_progress
                     if bar is not None:

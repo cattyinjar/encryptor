@@ -19,6 +19,8 @@ from __future__ import annotations
 import hashlib
 from typing import BinaryIO, Callable, Optional
 
+from .securemem import zero_all as secure_zero
+
 # 插件在 on_progress 中收到的回调类型：传入本调用处理的字节数
 ProgressFn = Callable[[int], None]
 
@@ -70,7 +72,46 @@ class CryptoPlugin:
     requires_password: bool = True
     password_hint: str = "密码"
 
+    # ---- 密钥文件模式（可选，默认关闭） -------------------------------
+    # credential_mode = "password"：GUI 显示密码输入框（默认行为，凭据是密码字符串）；
+    # credential_mode = "keyfile"  ：GUI 把凭据输入框替换为"密钥文件"选择框
+    #                               （取消掩码、附加浏览按钮），凭据字符串是文件路径。
+    # 无论哪种模式，凭据都通过 encrypt_stream / decrypt_stream 的 password 参数传入。
+    credential_mode: str = "password"
+    encrypt_credential_hint: str = "密钥文件"   # 加密侧（通常是公钥文件）的行标签
+    decrypt_credential_hint: str = "密钥文件"   # 解密侧（通常是私钥文件）的行标签
+    credential_filetypes = [("PEM 密钥文件", "*.pem"), ("所有文件", "*.*")]  # 文件对话框过滤
+    supports_keygen: bool = False              # True 时 GUI 显示"生成密钥对"按钮
+    # keyfile_needs_passphrase = True 时：GUI 在解密页的密钥文件行下方追加一个
+    # "口令"输入框，框架调用 encrypt_stream / decrypt_stream 时会额外传入
+    # passphrase 关键字参数（用户输入的口令，未输入为 None）。声明了本标志的
+    # 插件，两个流式方法都必须接受该参数（加密侧通常忽略它，因为公钥无口令）。
+    keyfile_needs_passphrase: bool = False
+
     # ---- 工具函数（子类可直接使用） ---------------------------------
+
+    def describe_credential(self, credential, passphrase=None) -> str:
+        """密钥文件插件可选实现：返回所选密钥文件的人类可读描述
+        （如 ``"RSA-3072（约 128 位安全强度）"``）。
+
+        GUI 在任务开始时调用并把结果写入日志，便于用户确认密钥强度。
+        实现应当轻量、尽力而为：抛出异常或返回空串时 GUI 静默忽略。
+        """
+        return ""
+
+    def generate_keypair(self, dest_dir, passphrase=None):
+        """密钥文件插件可选实现：在 ``dest_dir`` 下生成一对密钥文件，
+        返回 ``(公钥路径, 私钥路径)``。
+
+        :param passphrase: 私钥保护口令。给出时私钥文件以标准加密格式写出
+                           （PBKDF2 派生密钥 + AES 信封，PEM 头为
+                           ``BEGIN ENCRYPTED PRIVATE KEY``）；为 None 时写出
+                           明文私钥（``BEGIN PRIVATE KEY``）。公钥始终明文。
+
+        GUI 在 ``supports_keygen = True`` 时显示"生成密钥对"按钮并调用本方法。
+        默认不支持（抛 NotImplementedError）。
+        """
+        raise NotImplementedError(f"{self.name} 不支持自动生成密钥对")
 
     @staticmethod
     def derive_key(
@@ -86,6 +127,10 @@ class CryptoPlugin:
         :param salt:     随机盐（至少 16 字节，务必随机生成并存入元数据）
         :param length:   派生密钥字节数
         :param iterations: 迭代次数，建议 >= 100_000
+
+        返回值为 ``bytes``——用完必须在 ``finally`` 中 ``secure_zero(key)``
+        显式清零（本模块已 re-export 该函数）。同理，CEK、ECDH 共享秘密、
+        从密钥文件读入的私钥字节等都属于必须清零的敏感缓冲区。
         """
         return hashlib.pbkdf2_hmac(hash_name, password.encode("utf-8"), salt, iterations, dklen=length)
 

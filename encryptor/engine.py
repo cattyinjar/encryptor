@@ -81,6 +81,13 @@ def _cleanup(part: Path) -> None:
         pass
 
 
+def _plugin_call_kwargs(plugin: CryptoPlugin, passphrase: Optional[str]) -> dict:
+    """声明了 keyfile_needs_passphrase 的插件，额外收到 passphrase 关键字参数。"""
+    if getattr(plugin, "keyfile_needs_passphrase", False):
+        return {"passphrase": passphrase}
+    return {}
+
+
 def encrypt_file(
     plugin: CryptoPlugin,
     src_path: Path,
@@ -88,6 +95,7 @@ def encrypt_file(
     password: Optional[str],
     on_progress: Optional[ProgressFn] = None,
     cancel: Optional[CancelFlag] = None,
+    passphrase: Optional[str] = None,
 ) -> int:
     """加密 ``src_path`` → ``dst_path``，返回明文字节数。"""
     gate = _ProgressGate(on_progress, cancel)
@@ -102,7 +110,8 @@ def encrypt_file(
                 counter["n"] += n
                 gate(n)
 
-            metadata = plugin.encrypt_stream(src, out, password, wrapped)
+            metadata = plugin.encrypt_stream(src, out, password, wrapped,
+                                             **_plugin_call_kwargs(plugin, passphrase))
             container.write_trailer(out, metadata)
             total = counter["n"]
             out.flush()
@@ -122,6 +131,7 @@ def decrypt_file(
     expect_plugin_id: Optional[str] = None,
     on_progress: Optional[ProgressFn] = None,
     cancel: Optional[CancelFlag] = None,
+    passphrase: Optional[str] = None,
 ) -> int:
     """解密 ``src_path`` → ``dst_path``，返回明文字节数。
 
@@ -149,7 +159,8 @@ def decrypt_file(
                     counter["n"] += n
                     gate(n)
 
-                plugin.decrypt_stream(info.metadata, payload, out, password, wrapped)
+                plugin.decrypt_stream(info.metadata, payload, out, password, wrapped,
+                                      **_plugin_call_kwargs(plugin, passphrase))
                 total = counter["n"]
                 out.flush()
                 os.fsync(out.fileno())

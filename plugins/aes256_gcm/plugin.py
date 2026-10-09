@@ -32,6 +32,7 @@ from encryptor.sdk import (
     IntegrityError,
     ProgressFn,
     WrongPasswordError,
+    secure_zero,
 )
 
 CHUNK_SIZE = 1024 * 1024          # 1 MiB
@@ -70,23 +71,26 @@ class Plugin(CryptoPlugin):
         salt = os.urandom(SALT_LEN)
         nonce_prefix = os.urandom(NONCE_PREFIX_LEN)
         key = self.derive_key(password or "", salt, KEY_LEN, PBKDF2_ROUNDS)
-        cipher = AESGCM(key)
+        try:
+            cipher = AESGCM(key)
 
-        total = 0
-        index = 0
-        while True:
-            chunk = _read_exact(src, CHUNK_SIZE)
-            if not chunk:
-                break
-            nonce = nonce_prefix + index.to_bytes(4, "big")
-            dst.write(cipher.encrypt(nonce, chunk, None))
-            total += len(chunk)
-            on_progress(len(chunk))
-            index += 1
-            if len(chunk) < CHUNK_SIZE:
-                break
+            total = 0
+            index = 0
+            while True:
+                chunk = _read_exact(src, CHUNK_SIZE)
+                if not chunk:
+                    break
+                nonce = nonce_prefix + index.to_bytes(4, "big")
+                dst.write(cipher.encrypt(nonce, chunk, None))
+                total += len(chunk)
+                on_progress(len(chunk))
+                index += 1
+                if len(chunk) < CHUNK_SIZE:
+                    break
 
-        return salt + nonce_prefix + total.to_bytes(8, "big")
+            return salt + nonce_prefix + total.to_bytes(8, "big")
+        finally:
+            secure_zero(key)
 
     def decrypt_stream(
         self,
@@ -103,25 +107,28 @@ class Plugin(CryptoPlugin):
         expect_total = int.from_bytes(metadata[SALT_LEN + NONCE_PREFIX_LEN :], "big")
 
         key = self.derive_key(password or "", salt, KEY_LEN, PBKDF2_ROUNDS)
-        cipher = AESGCM(key)
+        try:
+            cipher = AESGCM(key)
 
-        total = 0
-        index = 0
-        while True:
-            blob = _read_exact(src, CHUNK_SIZE + TAG_LEN)
-            if not blob:
-                break
-            if len(blob) <= TAG_LEN:
-                raise IntegrityError("密文块不完整，文件已损坏")
-            nonce = nonce_prefix + index.to_bytes(4, "big")
-            try:
-                plain = cipher.decrypt(nonce, blob, None)
-            except InvalidTag:
-                raise WrongPasswordError("密码错误，或文件已被篡改/损坏")
-            dst.write(plain)
-            total += len(plain)
-            on_progress(len(plain))
-            index += 1
+            total = 0
+            index = 0
+            while True:
+                blob = _read_exact(src, CHUNK_SIZE + TAG_LEN)
+                if not blob:
+                    break
+                if len(blob) <= TAG_LEN:
+                    raise IntegrityError("密文块不完整，文件已损坏")
+                nonce = nonce_prefix + index.to_bytes(4, "big")
+                try:
+                    plain = cipher.decrypt(nonce, blob, None)
+                except InvalidTag:
+                    raise WrongPasswordError("密码错误，或文件已被篡改/损坏")
+                dst.write(plain)
+                total += len(plain)
+                on_progress(len(plain))
+                index += 1
+        finally:
+            secure_zero(key)
 
         if total != expect_total:
             raise IntegrityError(
