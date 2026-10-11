@@ -4,3 +4,7 @@
 .vscode/
 .codex/
 .claude/
+*.encx
+*.pem
+*.txt
+*.2
