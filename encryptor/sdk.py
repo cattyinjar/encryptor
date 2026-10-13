@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import BinaryIO, Callable, Optional
 
 from .securemem import zero_all as secure_zero
@@ -71,6 +72,9 @@ class CryptoPlugin:
     description: str = ""
     requires_password: bool = True
     password_hint: str = "密码"
+    # 算法是否具备完整性保护（AEAD/带 MAC）。默认 False——第三方插件必须
+    # 显式声明 True，GUI 才不会在选择时向用户显示"无防篡改能力"警告。
+    authenticated: bool = False
 
     # ---- 密钥文件模式（可选，默认关闭） -------------------------------
     # credential_mode = "password"：GUI 显示密码输入框（默认行为，凭据是密码字符串）；
@@ -89,6 +93,19 @@ class CryptoPlugin:
     keyfile_needs_passphrase: bool = False
 
     # ---- 工具函数（子类可直接使用） ---------------------------------
+
+    @staticmethod
+    def secure_random_int(order: int) -> int:
+        """用 CSPRNG 生成 [1, order) 内的随机整数（拒绝采样）。
+
+        供椭圆曲线私钥/临时密钥等场景使用。审计教训（F1）：**绝不要**用
+        ``random`` / ``random_hex`` 等非密码学随机源生成任何密钥材料。
+        """
+        nbytes = (order.bit_length() + 7) // 8
+        while True:
+            value = int.from_bytes(os.urandom(nbytes), "big")
+            if 1 <= value < order:
+                return value
 
     def describe_credential(self, credential, passphrase=None) -> str:
         """密钥文件插件可选实现：返回所选密钥文件的人类可读描述

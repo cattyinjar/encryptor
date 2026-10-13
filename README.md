@@ -29,39 +29,51 @@ python main.py               # 启动 GUI
 
 ## 内置的七种算法
 
+所有插件均基于**元数据 v2**：块级 AAD 绑定插件 id、元数据尾 MAC 认证全部
+字段（含总长，杜绝"无声截断"）、KDF 参数自描述、默认迭代 600k（OWASP 2023）。
+
 | 插件 | 凭据 | 说明 |
 |------|------|------|
-| `aes-256-gcm` | 密码 | PBKDF2 派生密钥 + 逐块 AES-GCM 认证加密，日常使用推荐 |
-| `xor-stream` | 密码 | 纯标准库流加密，插件开发教学模板，无认证能力 |
-| `rsa-oaep-aes256gcm` | **密钥文件** | 混合加密：随机 AES 密钥加密文件，RSA-3072 公钥（OAEP）保护该密钥；加密用公钥、解密用私钥 |
-| `ecdh-aes256gcm` | **密钥文件** | 混合加密（ECIES 风格）：临时密钥 ECDH 协商 + HKDF 派生密钥保护随机 AES 密钥 |
-| `sm4-gcm` | 密码 | 国密对称认证加密：PBKDF2-HMAC-SM3 派生密钥 + 逐块 SM4-GCM |
-| `sm3-stream` | 密码 | 国密教学示例：SM3 计数器密钥流 XOR（无认证能力） |
-| `sm2-sm4-gcm` | **密钥文件** | 国密套件混合加密：SM2 公钥保护随机 SM4 内容密钥（附 SM3 校验），文件逐块 SM4-GCM |
+| `aes-256-gcm` | 密码 | PBKDF2 派生双密钥 + 逐块 AES-GCM + 元数据 MAC，日常使用推荐 |
+| `xor-stream` | 密码 | 教学示例：SHA-256 密钥流 + HMAC 完整性 + 口令预验证 |
+| `rsa-oaep-aes256gcm` | **密钥文件** | 混合加密：随机 AES 密钥加密文件，RSA-3072 公钥（OAEP）保护该密钥 |
+| `ecdh-aes256gcm` | **密钥文件** | 混合加密（ECIES 风格）：临时密钥 ECDH + HKDF 保护随机 AES 密钥 |
+| `sm4-gcm` | 密码 | 国密对称认证加密：PBKDF2-HMAC-SM3 + 逐块 SM4-GCM |
+| `sm3-stream` | 密码 | 国密教学示例：SM3 密钥流 + HMAC-SM3 完整性 |
+| `sm2-sm4-gcm` | **密钥文件** | 国密套件：SM2 公钥（自实现，CSPRNG + C1 曲线校验 + C3 校验）保护 SM4 内容密钥 |
+
+全部插件依赖仅 `cryptography`（国密插件亦然——SM2 v2 起自实现曲线运算，
+不再依赖 gmssl；gmssl 仅在测试中用于交叉验证）。
 
 公钥类插件会在任务日志中显示密钥强度（如 `RSA-3072（约 128 位安全强度）`），
 并在加载时强制强度下限：RSA 低于 2048 位、ECC 曲线低于 256 位会被拒绝。
 
-## 敏感内存的显式清理
+## 敏感内存清理与进程隔离（多层防御）
 
-所有插件的密钥材料在使用完毕后**立即、同步**地从内存清零（`encryptor/securemem.py`）：
+**第一层：任务子进程（结构性）**。GUI 的全部密钥操作——加密/解密、密钥对
+生成、密钥强度描述——都在**短命子进程**中执行（`encryptor/jobrunner.py`），
+任务结束子进程退出，其地址空间（含第三方库内部的密钥副本）随之消亡。
+实测验证（`tests/test_subprocess_isolation.py`）：经该路径完成解密后，
+编排进程的全内存镜像中 ECC 私钥的**全部内存表示 0 命中**（修复前 2/3 概率
+残留完整 PKCS#8 DER）；代价是每任务约 0.1–0.3s 的子进程启动开销。
 
-- 派生密钥、内容密钥（CEK）、ECDH 共享秘密、私钥文件内容字节、逐块密钥流，
-  全部在 `finally` 块中清零——错误密码、数据损坏、用户取消等异常路径同样执行；
-- 清零在流式方法**返回之前**完成（不依赖垃圾回收），单次耗时约 2 微秒，
-  满足"操作完成后亚毫秒内销毁"；任务结束时日志会报告清零统计；
-- 机制：`bytearray` 原位覆写；不可变 `bytes` 经 ctypes 按 CPython 对象布局
-  覆写（导入时金丝雀自检，布局不符自动降级）。
+**第二层：插件内显式清零**（`encryptor/securemem.py`）。密钥材料在流式方法
+返回**之前**于 `finally` 中同步清零（微秒级，异常/取消路径不跳过），任务
+日志报告清零统计——防的是子进程存活期间的内存 dump。
 
-**Python 环境下诚实的能力边界**（无法覆盖的部分）：`str` 口令（不可变、可能
-驻留）无法可靠清零，只能清零插件经手的字节副本；OpenSSL/gmssl 库内部的密钥
-对象副本不受 Python 层控制；换页文件/休眠文件/崩溃转储等 OS 层面需配合全盘
-加密。对内存取证级对手，请考虑使用原生实现（如 libsodium）的工具。
+**诚实的能力边界**：`str` 口令在任务期间必然存在于父进程（发送给子进程的
+参数），子进程存活期间也可被 dump——进程模型保证的是"任务结束即不可达"，
+不是"从未存在"；页面文件/休眠文件/文件缓存属 OS 层，请配合全盘加密。
+对内存取证级对手，请考虑原生实现（libsodium 类）工具。
 
-国密插件依赖 `cryptography`（SM3/SM4），SM2 另需 `gmssl`：
+红队审计（`attack_lab/`）后的主要加固见 `docs/REMEDIATION_PLAN.md`：
+SM2 随机数/C1/C3 修复、全部插件元数据 v2（trailer MAC 杜绝无声截断）、
+KDF 600k 自描述、口令策略（加密侧 ≥8 位 + 弱口令表）、流插件完整性。
+
+国密插件依赖 `cryptography`（SM3/SM4；SM2 为自实现）：
 
 ```bash
-pip install cryptography gmssl
+pip install cryptography
 ```
 
 **SM2 密钥文件格式说明**：SM2 插件使用 Encryptor 自有封装格式（标准 SM2
@@ -93,10 +105,12 @@ openssl ec -in ecc_private_key.pem -pubout -out ecc_public_key.pem
 encryptor/
 ├── main.py                 # 启动入口
 ├── encryptor/
-│   ├── sdk.py              # 插件开发 SDK：CryptoPlugin 基类、异常、derive_key、secure_zero
+│   ├── sdk.py              # 插件开发 SDK：CryptoPlugin 基类、异常、derive_key、secure_zero、secure_random_int
+│   ├── aead.py             # ★ 分块认证加密共享层（v2 元数据：AAD/MAC/自描述 KDF）
 │   ├── container.py        # .encx 容器格式读写
 │   ├── plugin_manager.py   # 插件发现、加载、隔离坏插件
 │   ├── engine.py           # 加密/解密执行：临时文件、进度、取消
+│   ├── jobrunner.py        # 任务子进程执行器（密钥材料不进 GUI 进程）
 │   ├── securemem.py        # 敏感内存显式清理（secure zeroization）
 │   └── app.py              # Tkinter GUI
 ├── plugins/                # ★ 插件目录（算法都在这里）
@@ -111,9 +125,10 @@ encryptor/
 │   ├── PLUGIN_DEV.md       # ★ 插件开发指南
 │   └── FORMAT.md           # .encx 容器格式说明
 └── tests/
-    ├── test_roundtrip.py   # 端到端测试（114 项）
-    ├── test_gui_smoke.py   # GUI 冒烟测试（32 项）
-    └── test_securemem.py   # 敏感内存清理专项测试（23 项）
+    ├── test_roundtrip.py             # 端到端测试（128 项，含 F1/F2/F3/F5 回归向量）
+    ├── test_gui_smoke.py             # GUI 冒烟测试（35 项）
+    ├── test_securemem.py             # 敏感内存清理专项（23 项）
+    └── test_subprocess_isolation.py  # 子进程隔离取证验证（9 项）
 ```
 
 ## 快速开发一个自己的加密插件

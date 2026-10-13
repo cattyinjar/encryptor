@@ -24,6 +24,24 @@ from .sdk import CancelledError, IntegrityError, PluginError, WrongPasswordError
 APP_TITLE = f"Encryptor 单机加密解密工具 v{__version__}"
 GEOMETRY = "820x640"
 
+# 弱口令策略（审计 F4）：长度下限 + 常见弱口令拒绝
+MIN_PASSWORD_LEN = 8
+WEAK_PASSWORDS = {
+    "12345678", "123456789", "1234567890", "11111111", "00000000",
+    "password", "password1", "qwertyui", "qwertyuiop", "aaaaaaaa",
+    "abc12345", "abcd1234", "iloveyou", "sunshine", "letmein1",
+    "admin123", "root1234", "66666666", "88888888", "12341234",
+}
+
+
+def check_password_policy(password: str) -> Optional[str]:
+    """返回拒绝原因；通过时返回 None。"""
+    if len(password) < MIN_PASSWORD_LEN:
+        return f"密码至少需要 {MIN_PASSWORD_LEN} 位（当前 {len(password)} 位）。"
+    if password.lower() in WEAK_PASSWORDS:
+        return "该密码属于常见弱口令，请更换。"
+    return None
+
 
 class KeygenDialog(tk.Toplevel):
     """生成密钥对子窗口：选择保存目录，并可选择是否为私钥设置口令。
@@ -103,6 +121,10 @@ class KeygenDialog(tk.Toplevel):
             p1, p2 = self.pwd_var.get(), self.pwd2_var.get()
             if not p1:
                 messagebox.showwarning("缺少口令", "请输入私钥保护口令，或取消勾选口令保护。", parent=self)
+                return None
+            reason = check_password_policy(p1)
+            if reason:
+                messagebox.showwarning("口令强度不足", reason, parent=self)
                 return None
             if p1 != p2:
                 messagebox.showwarning("口令不一致", "两次输入的口令不一致。", parent=self)
@@ -417,6 +439,11 @@ class EncryptorApp:
             return
         desc = self.enc_desc_label if encrypt else self.dec_desc_label
         extra = "" if plugin.requires_password else "（该算法无需密码）"
+        if not getattr(plugin, "authenticated", False):
+            extra = "⚠ 该算法未声明完整性保护（无防篡改能力），请谨慎使用！" + extra
+            desc.config(foreground="#c0262c")
+        else:
+            desc.config(foreground="#555555")
         desc.config(text=(plugin.description or "（无描述）") + extra)
 
         if encrypt:
@@ -585,6 +612,9 @@ class EncryptorApp:
             (self.enc_pwd_var if encrypt else self.dec_pwd_var).set(path)
 
     def _generate_keypair(self) -> None:
+        """密钥对生成：在短命子进程中完成，父进程（GUI）不接触密钥字节。"""
+        if self._busy:
+            return
         plugin = self._selected_plugin(encrypt=True)
         if plugin is None:
             return
@@ -593,22 +623,24 @@ class EncryptorApp:
         if dialog.result is None:
             return
         dest, passphrase = dialog.result
-        self.root.config(cursor="watch")
-        try:
-            pub_path, priv_path = plugin.generate_keypair(Path(dest), passphrase=passphrase)
-        except Exception as exc:
-            self.log(f"生成密钥对失败：{exc}", "err")
-            messagebox.showerror("生成密钥对失败", str(exc), parent=self.root)
-            return
-        finally:
-            self.root.config(cursor="")
-        self.enc_pwd_var.set(str(pub_path))
+
+        from . import jobrunner
+
         protection = "口令保护" if passphrase else "无保护（明文私钥，请妥善保管）"
-        self.log(
-            f"已生成密钥对（{plugin.name}，私钥{protection}）：\n  公钥 {pub_path}\n  私钥 {priv_path}\n"
-            f"公钥用于加密、私钥用于解密；私钥路径请妥善保管，公钥路径已自动填入。",
-            "ok",
-        )
+        self._cancel_flag = None  # 密钥生成不提供取消
+        self._set_busy(True, "正在生成密钥对…")
+        self._keygen_ctx = (plugin.name, protection)
+        self.log(f"开始生成密钥对（{plugin.name}，私钥{protection}），目录：{dest}", "info")
+
+        def worker():
+            ok, message = jobrunner.run_in_subprocess(
+                {"kind": "keygen", "plugin_id": plugin.id,
+                 "dest": str(dest), "passphrase": passphrase},
+                on_event=lambda ev: self._event_queue.put(ev),
+            )
+            self._event_queue.put(("done", ok, message))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ------------------------------------------------------------------
     # 任务执行
@@ -660,8 +692,13 @@ class EncryptorApp:
             password = cred_var.get()
             if not password:
                 raise PluginError("请输入密码。")
-            if encrypt and password != self.enc_pwd2_var.get():
-                raise PluginError("两次输入的密码不一致。")
+            # 口令策略只在加密侧强制：解密口令由既有文件决定，不做限制
+            if encrypt:
+                reason = check_password_policy(password)
+                if reason:
+                    raise PluginError(reason)
+                if password != self.enc_pwd2_var.get():
+                    raise PluginError("两次输入的密码不一致。")
         if dst.exists():
             ok = messagebox.askyesno(
                 "覆盖确认", f"目标文件已存在，是否覆盖？\n\n{dst}", parent=self.root
@@ -673,6 +710,16 @@ class EncryptorApp:
     def _start_job(self, encrypt: bool) -> None:
         if self._busy:
             return
+        pre_plugin = self._selected_plugin(encrypt)
+        if pre_plugin is not None and not getattr(pre_plugin, "authenticated", False):
+            ok = messagebox.askyesno(
+                "安全提示",
+                f"算法 [{pre_plugin.name}] 未声明完整性保护（authenticated=False），\n"
+                "密文可被篡改而无法察觉。\n\n确定继续使用该算法吗？",
+                parent=self.root,
+            )
+            if not ok:
+                return
         try:
             plugin, src, dst, password, passphrase = self._validate(encrypt)
         except CancelledError as exc:
@@ -705,63 +752,26 @@ class EncryptorApp:
         self._worker.start()
 
     def _run_job(self, encrypt, plugin, src, dst, password, passphrase, total) -> None:
-        from . import securemem
+        from . import jobrunner
 
         q = self._event_queue
-        processed = [0]
-        last_report = [0.0]
-        mem_before = securemem.snapshot()
-
-        def on_progress(n: int) -> None:
-            processed[0] += n
-            now = time.monotonic()
-            if now - last_report[0] > 0.1 or processed[0] >= total:
-                last_report[0] = now
-                pct = min(100, processed[0] * 100 // total) if total else 100
-                q.put(("progress", pct))
-
-        def finish(ok: bool, message: str) -> None:
-            delta = securemem.stats_delta(mem_before)
-            note = ""
-            if delta["calls"]:
-                note = f"（敏感内存已清零 {delta['calls']} 处 / {delta['bytes']} 字节，任务结束前同步完成）"
-            q.put(("done", ok, message + note))
-
-        try:
-            # 密钥强度等信息由插件描述，写入任务日志（失败静默忽略）
-            describe = getattr(plugin, "describe_credential", None)
-            if callable(describe) and password:
-                try:
-                    note = describe(password, passphrase=passphrase)
-                except Exception:
-                    note = ""
-                if note:
-                    q.put(("log", f"密钥：{note}", "info"))
-            if encrypt:
-                n = engine.encrypt_file(plugin, src, dst, password, on_progress,
-                                        self._cancel_flag, passphrase=passphrase)
-                finish(True, f"加密完成：{dst}（明文 {n:,} 字节）")
-            else:
-                n = engine.decrypt_file(
-                    plugin, src, dst, password,
-                    expect_plugin_id=plugin.id,
-                    on_progress=on_progress, cancel=self._cancel_flag,
-                    passphrase=passphrase,
-                )
-                finish(True, f"解密完成：{dst}（明文 {n:,} 字节）")
-        except CancelledError as exc:
-            finish(False, f"已取消：{exc or '用户取消'}")
-        except WrongPasswordError as exc:
-            finish(False, f"密码错误或文件已损坏：{exc}")
-        except ContainerError as exc:
-            finish(False, f"文件格式错误：{exc}")
-        except IntegrityError as exc:
-            finish(False, f"数据校验失败：{exc}")
-        except PluginError as exc:
-            finish(False, f"插件错误：{exc}")
-        except Exception as exc:
-            detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-            finish(False, f"未知错误（{type(exc).__name__}）：{detail}")
+        spec = {
+            "kind": "crypto",
+            "encrypt": encrypt,
+            "plugin_id": plugin.id,
+            "src": str(src),
+            "dst": str(dst),
+            "password": password,
+            "passphrase": passphrase,
+            "credential": password if getattr(plugin, "credential_mode", "password") == "keyfile" else None,
+            "total": total,
+        }
+        ok, message = jobrunner.run_in_subprocess(
+            spec,
+            on_event=lambda ev: q.put(ev),
+            cancel_flag=self._cancel_flag,
+        )
+        q.put(("done", ok, message))
 
     def _poll_events(self) -> None:
         try:
@@ -771,6 +781,14 @@ class EncryptorApp:
                 if kind == "log":
                     _, text, level = event
                     self.log(text, level)
+                elif kind == "keygen":
+                    _, pub_path, priv_path = event
+                    self.enc_pwd_var.set(pub_path)
+                    self.log(
+                        f"  公钥 {pub_path}\n  私钥 {priv_path}\n"
+                        "公钥用于加密、私钥用于解密；私钥路径请妥善保管，公钥路径已自动填入。",
+                        "ok",
+                    )
                 elif kind == "progress":
                     _, percent = event
                     bar, label = self._active_progress

@@ -191,6 +191,41 @@ CEK = os.urandom(32)                      # 1. 每次加密随机生成内容密
 完整参考实现：[plugins/rsa_hybrid/plugin.py](../plugins/rsa_hybrid/plugin.py)、
 [plugins/ecdh_hybrid/plugin.py](../plugins/ecdh_hybrid/plugin.py)。
 
+### 认证加密请用共享层（必须遵守）
+
+审计教训（F2 无声截断）：分块 GCM 的正确用法（AAD 绑定、元数据 MAC、
+KDF 自描述）已收敛到 **`encryptor/aead.py`**——新插件做认证加密**必须**用它，
+不要手写分块循环：
+
+```python
+from encryptor import aead
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import algorithms as _algs
+
+def encrypt_stream(self, src, dst, password, on_progress):
+    salt = os.urandom(16)
+    enc_key, mac_key = aead.derive_dual_key(password, salt, aead.DEFAULT_ITERATIONS,
+                                            32, aead.KDF_PBKDF2_SHA256)
+    try:
+        total = aead.stream_encrypt(enc_key, _algs.AES, nonce_prefix, src, dst,
+                                    on_progress, self.id.encode("ascii"))
+        return aead.build_password_meta(self.id, aead.KDF_PBKDF2_SHA256,
+                                        aead.DEFAULT_ITERATIONS, salt, nonce_prefix,
+                                        total, mac_key, hashes.SHA256)
+    finally:
+        secure_zero(enc_key, mac_key)
+```
+
+公钥混合插件同样使用 aead 的内容层 + `aead.meta_mac_key(cek, hash)` 做元数据
+MAC（参考 rsa_hybrid / sm2_hybrid）。
+
+另两条硬性约定：
+
+- 类属性 `authenticated = True` 只有在密文具备完整性保护（AEAD/带 MAC）时
+  才能声明；未声明的插件 GUI 会向用户显示"无防篡改能力"警告并要求确认；
+- 椭圆曲线私钥/临时标量一律用 `self.secure_random_int(order)` 生成
+  （审计 F1：绝不要用 `random`/`random_hex` 等非密码学随机源）。
+
 ### 敏感内存清理（必须遵守）
 
 插件持有的所有密钥材料——派生密钥、CEK、ECDH 共享秘密、从密钥文件读入的

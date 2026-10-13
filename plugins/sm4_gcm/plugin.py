@@ -1,19 +1,14 @@
-"""SM4-GCM 国密对称加密插件（密码模式）。
+"""SM4-GCM 国密对称加密插件（密码模式，元数据 v2）。
 
-国密套件的标准组合思路，全部使用国密原语：
+与 aes-256-gcm 插件结构一一对应，全部使用国密原语；内容层由共享层
+encryptor/aead.py 提供（块 AAD 绑定插件 id、trailer MAC 认证全部元数据，
+修复审计发现 F2 的无声截断）：
 
-  密钥 = PBKDF2-HMAC-SM3(密码, salt, 32 字节, 200_000 轮)
-  内容 = 逐块 SM4-GCM 认证加密（1 MiB 分块，nonce = 随机前缀 8B || 块计数 4B）
+  密钥对 = PBKDF2-HMAC-SM3(密码, salt, 600_000 轮) → 16B 加密密钥 + 32B MAC 密钥
+  内容   = 逐块 SM4-GCM（GB/T 32907 SM4，1 MiB 分块）
+  元数据 = ver(2) ‖ kdf_id ‖ 迭代数(4B) ‖ salt(16) ‖ nonce_prefix(8) ‖ 总长(8) ‖ MAC(32)
 
-结构上与 aes-256-gcm 插件一一对应：SM3 替代 SHA-256 做密钥派生，
-SM4（GB/T 32907-2016，128 位分组/密钥）替代 AES。逐块认证、截断检测、
-错密码检测能力与 AES 插件完全一致。
-
-元数据布局（共 32 字节）::
-
-    salt(16) || nonce_prefix(8) || 明文总长度(8, 大端)
-
-依赖：cryptography >= 36（提供 SM4 分组密码与 SM3 哈希）。
+依赖：cryptography（SM4 分组密码与 SM3 哈希）。
 """
 
 from __future__ import annotations
@@ -21,16 +16,10 @@ from __future__ import annotations
 import os
 from typing import BinaryIO, Optional
 
-try:
-    from cryptography.exceptions import InvalidTag
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-except ImportError as _exc:  # 由插件管理器捕获并展示原因
-    raise ImportError(
-        "本插件依赖第三方库 cryptography，请先执行: pip install cryptography"
-    ) from _exc
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import algorithms as _algs
 
+from encryptor import aead
 from encryptor.sdk import (
     CryptoPlugin,
     IntegrityError,
@@ -39,49 +28,18 @@ from encryptor.sdk import (
     secure_zero,
 )
 
-CHUNK_SIZE = 1024 * 1024          # 1 MiB，同 aes-256-gcm 插件
-KEY_LEN = 16                      # SM4 密钥 128 位
-SALT_LEN = 16
-NONCE_PREFIX_LEN = 8              # + 4 字节块计数 = 12 字节 GCM nonce
-TAG_LEN = 16                      # GCM 认证标签
-PBKDF2_ROUNDS = 200_000
-META_LEN = SALT_LEN + NONCE_PREFIX_LEN + 8
-
-
-def _read_exact(src: BinaryIO, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        part = src.read(n - len(buf))
-        if not part:
-            break
-        buf += part
-    return bytes(buf)
-
-
-def _derive_key(password: str, salt: bytes) -> bytes:
-    return PBKDF2HMAC(
-        algorithm=hashes.SM3(), length=KEY_LEN, salt=salt, iterations=PBKDF2_ROUNDS
-    ).derive(password.encode("utf-8"))
-
-
-def _gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
-    """单块 SM4-GCM：返回 密文||16 字节标签（与 AESGCM 一次性接口格式一致）。"""
-    enc = Cipher(algorithms.SM4(key), modes.GCM(nonce)).encryptor()
-    ct = enc.update(plaintext) + enc.finalize()
-    return ct + enc.tag
-
-
-def _gcm_decrypt(key: bytes, nonce: bytes, blob: bytes) -> bytes:
-    dec = Cipher(algorithms.SM4(key), modes.GCM(nonce, blob[-TAG_LEN:])).decryptor()
-    return dec.update(blob[:-TAG_LEN]) + dec.finalize()  # 失败抛 InvalidTag
+KDF_ID = aead.KDF_PBKDF2_SM3
+ITERATIONS = aead.DEFAULT_ITERATIONS     # 600k（审计 F4）
+ENC_KEY_LEN = 16                         # SM4 密钥 128 位
 
 
 class Plugin(CryptoPlugin):
     id = "sm4-gcm"
     name = "SM4-GCM（国密）"
-    version = "1.0.0"
+    version = "2.0.0"
     author = "Encryptor 内置示例"
     description = "国密对称认证加密：PBKDF2-HMAC-SM3 派生密钥 + 逐块 SM4-GCM，防篡改、防截断"
+    authenticated = True
 
     def encrypt_stream(
         self,
@@ -90,26 +48,22 @@ class Plugin(CryptoPlugin):
         password: Optional[str],
         on_progress: ProgressFn,
     ) -> bytes:
-        salt = os.urandom(SALT_LEN)
-        nonce_prefix = os.urandom(NONCE_PREFIX_LEN)
-        key = _derive_key(password or "", salt)
+        salt = os.urandom(16)
+        nonce_prefix = os.urandom(aead.NONCE_PREFIX_LEN)
+        enc_key, mac_key = aead.derive_dual_key(
+            password or "", salt, ITERATIONS, ENC_KEY_LEN, KDF_ID
+        )
         try:
-            total, index = 0, 0
-            while True:
-                chunk = _read_exact(src, CHUNK_SIZE)
-                if not chunk:
-                    break
-                nonce = nonce_prefix + index.to_bytes(4, "big")
-                dst.write(_gcm_encrypt(key, nonce, chunk))
-                total += len(chunk)
-                on_progress(len(chunk))
-                index += 1
-                if len(chunk) < CHUNK_SIZE:
-                    break
-
-            return salt + nonce_prefix + total.to_bytes(8, "big")
+            total = aead.stream_encrypt(
+                enc_key, _algs.SM4, nonce_prefix, src, dst,
+                on_progress, self.id.encode("ascii"),
+            )
+            return aead.build_password_meta(
+                self.id, KDF_ID, ITERATIONS, salt, nonce_prefix, total,
+                mac_key, hashes.SM3,
+            )
         finally:
-            secure_zero(key)
+            secure_zero(enc_key, mac_key)
 
     def decrypt_stream(
         self,
@@ -119,33 +73,23 @@ class Plugin(CryptoPlugin):
         password: Optional[str],
         on_progress: ProgressFn,
     ) -> None:
-        if len(metadata) != META_LEN:
-            raise IntegrityError("元数据长度不正确，文件可能已损坏")
-        salt = metadata[:SALT_LEN]
-        nonce_prefix = metadata[SALT_LEN : SALT_LEN + NONCE_PREFIX_LEN]
-        expect_total = int.from_bytes(metadata[SALT_LEN + NONCE_PREFIX_LEN :], "big")
-        key = _derive_key(password or "", salt)
+        kdf_id, iterations, salt, nonce_prefix, total, mac = aead.verify_password_meta(
+            metadata, self.id
+        )
+        if kdf_id != KDF_ID:
+            raise IntegrityError(f"KDF 标识不匹配（{kdf_id}），文件可能已损坏")
+        enc_key = mac_key = None
         try:
-            total, index = 0, 0
-            while True:
-                blob = _read_exact(src, CHUNK_SIZE + TAG_LEN)
-                if not blob:
-                    break
-                if len(blob) <= TAG_LEN:
-                    raise IntegrityError("密文块不完整，文件已损坏")
-                nonce = nonce_prefix + index.to_bytes(4, "big")
-                try:
-                    plain = _gcm_decrypt(key, nonce, blob)
-                except InvalidTag:
-                    raise WrongPasswordError("密码错误，或文件已被篡改/损坏")
-                dst.write(plain)
-                total += len(plain)
-                on_progress(len(plain))
-                index += 1
-        finally:
-            secure_zero(key)
-
-        if total != expect_total:
-            raise IntegrityError(
-                f"解密长度不符（期望 {expect_total} 字节，实际 {total} 字节），文件可能被截断"
+            enc_key, mac_key = aead.derive_dual_key(
+                password or "", salt, iterations, ENC_KEY_LEN, kdf_id
             )
+            mac_input, expect = aead.password_meta_mac_input(metadata, self.id)
+            actual = aead.hmac_digest(hashes.SM3, mac_key, mac_input)
+            if not aead.constant_time_equal(actual, expect):
+                raise WrongPasswordError("密码错误，或文件已被篡改/损坏")
+            aead.stream_decrypt(
+                enc_key, _algs.SM4, nonce_prefix, total, src, dst,
+                on_progress, self.id.encode("ascii"),
+            )
+        finally:
+            secure_zero(enc_key, mac_key)

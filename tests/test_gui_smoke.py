@@ -96,6 +96,25 @@ def main() -> int:
         check("错误密码在 GUI 中报错", "密码错误" in last, last)
         check("错误密码不产生输出", not dec_bad.exists() and not Path(str(dec_bad) + '.part').exists())
 
+        # ---- 口令策略（审计 F4）----
+        app.enc_plugin_var.set(app.enc_plugin_combo["values"][0])  # AES
+        app._on_plugin_selected(encrypt=True)
+        app.enc_src_var.set(str(src))
+        out_short = tmp / "short_pw.encx"
+        app.enc_dst_var.set(str(out_short))
+        app.enc_pwd_var.set("abc123")
+        app.enc_pwd2_var.set("abc123")
+        app._start_job(encrypt=True)
+        app.root.update()
+        check("过短密码被策略拒绝",
+              "至少" in app.log_text.get("1.0", "end") and not out_short.exists())
+        app.enc_pwd_var.set("12345678")
+        app.enc_pwd2_var.set("12345678")
+        app._start_job(encrypt=True)
+        app.root.update()
+        check("常见弱口令被策略拒绝",
+              "弱口令" in app.log_text.get("1.0", "end") and not out_short.exists())
+
         # ---- 刷新插件 ----
         app.reload_plugins()
         check("刷新后插件数量不变", len(app.registry.loaded) == 7)

@@ -1,27 +1,20 @@
-"""ECDH + AES-256-GCM 混合加密插件（密钥文件模式，ECIES 风格）。
+"""ECDH + AES-256-GCM 混合加密插件（密钥文件模式，ECIES 风格，元数据 v2）。
 
-ECC 公钥加密同样不能直接处理大文件，采用椭圆曲线集成加密（ECIES）思路：
+  1. 每次加密随机生成 32 字节内容密钥 CEK；
+  2. 文件内容用 CEK 做逐块 AES-256-GCM（共享层 encryptor/aead.py：块 AAD
+     绑定插件 id，trailer MAC 认证全部元数据，修复审计 F2 无声截断）；
+  3. 每次加密生成临时 ECC 密钥对，与接收方公钥做 ECDH → HKDF-SHA256 派生
+     KEK → AES-GCM 包裹 CEK；临时公钥与包裹结果存入元数据。
 
-  1. 随机生成 32 字节内容密钥 CEK；
-  2. 文件内容用 CEK 做逐块 AES-256-GCM（分块方案同 aes-256-gcm 插件）；
-  3. 每次加密生成一个临时 ECC 密钥对，与接收方公钥做 ECDH 密钥协商，
-     经 HKDF-SHA256 派生出密钥加密密钥 KEK，用 KEK(AES-GCM) 包裹 CEK；
-     临时公钥与包裹结果一起存入容器元数据。
+密钥文件为标准 PEM（与 openssl 互通）；加载时强制曲线强度下限（<256 位拒绝）；
+解密侧对临时公钥做在曲线校验（cryptography from_encoded_point）。
 
-解密方用自己的私钥 + 元数据中的临时公钥重演出相同 KEK，解开 CEK。
-该结构提供前向保密语义外的标准 ECIES 安全性（每次加密 CEK 独立随机）。
+元数据布局（大端，v2）::
 
-密钥文件为标准 PEM 格式（公钥 SubjectPublicKeyInfo / 私钥 PKCS#8），与
-openssl 生成的 ECC 密钥互通（曲线不限，建议 P-256 及以上）：
-  openssl ecparam -name prime256v1 -genkey -noout -out ecc_private_key.pem
-  openssl ec -in ecc_private_key.pem -pubout -out ecc_public_key.pem
+    ver(1)=2 ‖ eph_len(2) ‖ 临时公钥压缩点 ‖ wrap_nonce(12) ‖ wrapped CEK(48)
+    ‖ nonce_prefix(8) ‖ 明文总长(8) ‖ MAC(32)
 
-用法：加密选公钥文件，解密选私钥文件（无需密码）。
-
-元数据布局（大端）::
-
-    eph_pub_len(2) || 临时公钥压缩点 || wrap_nonce(12) || wrapped_cek(48)
-    || nonce_prefix(8) || 明文总长(8)
+依赖：cryptography。
 """
 
 from __future__ import annotations
@@ -30,17 +23,14 @@ import os
 from pathlib import Path
 from typing import BinaryIO, Optional, Tuple
 
-try:
-    from cryptography.exceptions import InvalidTag
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-except ImportError as _exc:  # 由插件管理器捕获并展示原因
-    raise ImportError(
-        "本插件依赖第三方库 cryptography，请先执行: pip install cryptography"
-    ) from _exc
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers import algorithms as _algs
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from encryptor import aead
 from encryptor.sdk import (
     CryptoPlugin,
     IntegrityError,
@@ -50,26 +40,11 @@ from encryptor.sdk import (
     secure_zero,
 )
 
-CHUNK_SIZE = 1024 * 1024          # 1 MiB，同 aes-256-gcm 插件
 CEK_LEN = 32
-WRAP_NONCE_LEN = 12               # 包裹 CEK 用的 GCM nonce
+WRAP_NONCE_LEN = 12
 WRAPPED_LEN = CEK_LEN + 16        # CEK + GCM 标签
-NONCE_PREFIX_LEN = 8
-TAG_LEN = 16
 HKDF_INFO = b"encryptor/ecdh-aes256gcm/kek"
-
-# 元数据中"包裹部分"之后的内容段固定长度
-_META_TAIL_LEN = WRAP_NONCE_LEN + WRAPPED_LEN + NONCE_PREFIX_LEN + 8
-
-
-def _read_exact(src: BinaryIO, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        part = src.read(n - len(buf))
-        if not part:
-            break
-        buf += part
-    return bytes(buf)
+_META_MIN = 1 + 2 + WRAP_NONCE_LEN + WRAPPED_LEN + aead.NONCE_PREFIX_LEN + 8 + aead.MAC_LEN
 
 
 def _ensure_strength(key) -> None:
@@ -118,7 +93,6 @@ def _load_private_key(credential: str, passphrase: Optional[str] = None) -> ec.E
                 raise PluginError(
                     "该私钥文件设有口令保护，请在解密页的『口令』栏输入口令后重试。"
                 ) from None
-            # 文件本身未加密而用户多输了口令：忽略口令直接加载
             try:
                 key = serialization.load_pem_private_key(data, password=None)
             except (ValueError, TypeError) as exc:
@@ -143,51 +117,10 @@ def _derive_kek(shared_secret: bytes, eph_pub_bytes: bytes) -> bytes:
     ).derive(shared_secret)
 
 
-def _stream_encrypt(cipher: AESGCM, nonce_prefix: bytes, src: BinaryIO, dst: BinaryIO,
-                    on_progress: ProgressFn) -> int:
-    total, index = 0, 0
-    while True:
-        chunk = _read_exact(src, CHUNK_SIZE)
-        if not chunk:
-            break
-        nonce = nonce_prefix + index.to_bytes(4, "big")
-        dst.write(cipher.encrypt(nonce, chunk, None))
-        total += len(chunk)
-        on_progress(len(chunk))
-        index += 1
-        if len(chunk) < CHUNK_SIZE:
-            break
-    return total
-
-
-def _stream_decrypt(cipher: AESGCM, nonce_prefix: bytes, expect_total: int,
-                    src: BinaryIO, dst: BinaryIO, on_progress: ProgressFn) -> None:
-    total, index = 0, 0
-    while True:
-        blob = _read_exact(src, CHUNK_SIZE + TAG_LEN)
-        if not blob:
-            break
-        if len(blob) <= TAG_LEN:
-            raise IntegrityError("密文块不完整，文件已损坏")
-        nonce = nonce_prefix + index.to_bytes(4, "big")
-        try:
-            plain = cipher.decrypt(nonce, blob, None)
-        except InvalidTag:
-            raise WrongPasswordError("私钥不匹配，或文件已被篡改/损坏")
-        dst.write(plain)
-        total += len(plain)
-        on_progress(len(plain))
-        index += 1
-    if total != expect_total:
-        raise IntegrityError(
-            f"解密长度不符（期望 {expect_total} 字节，实际 {total} 字节），文件可能被截断"
-        )
-
-
 class Plugin(CryptoPlugin):
     id = "ecdh-aes256gcm"
     name = "ECC 混合加密（ECDH）"
-    version = "1.0.0"
+    version = "2.0.0"
     author = "Encryptor 内置示例"
     description = (
         "密钥文件模式：文件用随机 AES-256-GCM 密钥加密，该密钥经临时密钥 ECDH 协商"
@@ -198,6 +131,7 @@ class Plugin(CryptoPlugin):
     decrypt_credential_hint = "私钥文件"
     supports_keygen = True
     keyfile_needs_passphrase = True   # 私钥可能是带口令的加密 PEM
+    authenticated = True
 
     def describe_credential(self, credential, passphrase=None) -> str:
         try:
@@ -234,7 +168,6 @@ class Plugin(CryptoPlugin):
                 serialization.PublicFormat.SubjectPublicKeyInfo,
             )
         )
-        # 给出口令 → 标准加密私钥（PBKDF2+AES 信封，openssl 互通）；否则明文私钥
         encryption = (
             serialization.BestAvailableEncryption(passphrase.encode("utf-8"))
             if passphrase
@@ -259,7 +192,7 @@ class Plugin(CryptoPlugin):
     ) -> bytes:
         recip_pub = _load_public_key(credential or "")
         cek = os.urandom(CEK_LEN)
-        shared = kek = None
+        shared = kek = mac_key = None
         try:
             # 临时密钥对：曲线跟随接收方公钥
             eph_priv = ec.generate_private_key(recip_pub.curve)
@@ -272,15 +205,23 @@ class Plugin(CryptoPlugin):
             wrap_nonce = os.urandom(WRAP_NONCE_LEN)
             wrapped = AESGCM(kek).encrypt(wrap_nonce, cek, None)
 
-            nonce_prefix = os.urandom(NONCE_PREFIX_LEN)
-            total = _stream_encrypt(AESGCM(cek), nonce_prefix, src, dst, on_progress)
-            return (
-                len(eph_pub_bytes).to_bytes(2, "big")
+            nonce_prefix = os.urandom(aead.NONCE_PREFIX_LEN)
+            total = aead.stream_encrypt(
+                cek, _algs.AES, nonce_prefix, src, dst,
+                on_progress, self.id.encode("ascii"),
+            )
+            mac_key = aead.meta_mac_key(cek, hashes.SHA256)
+            meta = (
+                bytes([aead.META_VERSION])
+                + len(eph_pub_bytes).to_bytes(2, "big")
                 + eph_pub_bytes + wrap_nonce + wrapped
                 + nonce_prefix + total.to_bytes(8, "big")
             )
+            return meta + aead.hmac_digest(
+                hashes.SHA256, mac_key, meta + self.id.encode("ascii")
+            )
         finally:
-            secure_zero(cek, shared, kek)
+            secure_zero(cek, shared, kek, mac_key)
 
     def decrypt_stream(
         self,
@@ -291,28 +232,33 @@ class Plugin(CryptoPlugin):
         on_progress: ProgressFn,
         passphrase: Optional[str] = None,
     ) -> None:
-        if len(metadata) < 2 + _META_TAIL_LEN:
-            raise IntegrityError("元数据不完整，文件可能已损坏")
-        eph_len = int.from_bytes(metadata[:2], "big")
-        eph_pub_bytes = metadata[2 : 2 + eph_len]
-        off = 2 + eph_len
+        if len(metadata) < _META_MIN or metadata[0] != aead.META_VERSION:
+            raise IntegrityError("元数据长度或版本不正确，文件可能已损坏")
+        eph_len = int.from_bytes(metadata[1:3], "big")
+        eph_pub_bytes = metadata[3 : 3 + eph_len]
+        off = 3 + eph_len
         wrap_nonce = metadata[off : off + WRAP_NONCE_LEN]
         wrapped = metadata[off + WRAP_NONCE_LEN : off + WRAP_NONCE_LEN + WRAPPED_LEN]
-        tail = metadata[off + WRAP_NONCE_LEN + WRAPPED_LEN : off + _META_TAIL_LEN]
+        nonce_prefix = metadata[off + WRAP_NONCE_LEN + WRAPPED_LEN :
+                                off + WRAP_NONCE_LEN + WRAPPED_LEN + aead.NONCE_PREFIX_LEN]
+        expect_total = int.from_bytes(
+            metadata[off + WRAP_NONCE_LEN + WRAPPED_LEN + aead.NONCE_PREFIX_LEN : -aead.MAC_LEN],
+            "big",
+        )
+        mac = metadata[-aead.MAC_LEN:]
         if (
             len(eph_pub_bytes) != eph_len
             or len(wrap_nonce) != WRAP_NONCE_LEN
             or len(wrapped) != WRAPPED_LEN
-            or len(tail) != NONCE_PREFIX_LEN + 8
+            or len(nonce_prefix) != aead.NONCE_PREFIX_LEN
         ):
             raise IntegrityError("元数据不完整，文件可能已损坏")
-        nonce_prefix = tail[:NONCE_PREFIX_LEN]
-        expect_total = int.from_bytes(tail[NONCE_PREFIX_LEN:], "big")
 
         priv = _load_private_key(credential or "", passphrase)
-        cek = shared = kek = None
+        cek = shared = kek = mac_key = None
         try:
             try:
+                # from_encoded_point 做在曲线校验（对照：审计 F3 中 SM2 曾缺失此步）
                 eph_pub = ec.EllipticCurvePublicKey.from_encoded_point(priv.curve, eph_pub_bytes)
                 shared = priv.exchange(ec.ECDH(), eph_pub)
             except ValueError as exc:
@@ -324,6 +270,15 @@ class Plugin(CryptoPlugin):
                 cek = AESGCM(kek).decrypt(wrap_nonce, wrapped, None)
             except InvalidTag as exc:
                 raise WrongPasswordError("私钥不匹配，或文件已被篡改/损坏") from exc
-            _stream_decrypt(AESGCM(cek), nonce_prefix, expect_total, src, dst, on_progress)
+            mac_key = aead.meta_mac_key(cek, hashes.SHA256)
+            expect_mac = aead.hmac_digest(
+                hashes.SHA256, mac_key, metadata[:-aead.MAC_LEN] + self.id.encode("ascii")
+            )
+            if not aead.constant_time_equal(expect_mac, mac):
+                raise IntegrityError("元数据校验失败，文件已被篡改或损坏。")
+            aead.stream_decrypt(
+                cek, _algs.AES, nonce_prefix, expect_total, src, dst,
+                on_progress, self.id.encode("ascii"),
+            )
         finally:
-            secure_zero(cek, shared, kek)
+            secure_zero(cek, shared, kek, mac_key)

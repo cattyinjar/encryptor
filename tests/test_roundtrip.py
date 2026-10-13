@@ -66,6 +66,26 @@ def expect_raises(exc_type, fn, *args, **kwargs):
     return False
 
 
+def truncate_rewrite_total(src: Path, out: Path, total_off_in_meta: int, chunk_plain: int = 1024 * 1024):
+    """审计 F2 攻击向量：删除最后一个整块密文 + 改写元数据总长字段。"""
+    import struct as _st
+    raw = bytearray(src.read_bytes())
+    (mlen,) = _st.unpack("<I", bytes(raw[-4:]))
+    meta_off = len(raw) - 4 - mlen
+    (pid_len,) = _st.unpack("<H", bytes(raw[5:7]))
+    head = 7 + pid_len
+    chunk = chunk_plain + 16
+    n_chunks = (meta_off - head) // chunk
+    assert n_chunks >= 2, "样本需跨块"
+    start = head + (n_chunks - 1) * chunk
+    del raw[start : start + chunk]
+    meta_off = len(raw) - 4 - mlen
+    toff = meta_off + total_off_in_meta
+    old = int.from_bytes(raw[toff : toff + 8], "big")
+    raw[toff : toff + 8] = (old - chunk_plain).to_bytes(8, "big")
+    out.write_bytes(raw)
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="encx_test_"))
     try:
@@ -117,10 +137,16 @@ def main() -> int:
         enc_xor = tmp / "text.txt.x.encx"
         engine.encrypt_file(xor, samples["text.txt"], enc_xor, "pw-测试123")
         dec_xor_bad = tmp / "bad_xor.out"
-        engine.decrypt_file(xor, enc_xor, dec_xor_bad, "wrong")  # XOR 无认证，不抛错
-        check("XOR 错密码结果不等于原文",
-              dec_xor_bad.read_bytes() != samples["text.txt"].read_bytes())
-        dec_xor_bad.unlink()
+        # v2 起流插件带口令预验证：错口令立即报错（不再静默输出乱码）
+        check("XOR 错密码被立即拒绝（v2 预验证器）",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            xor, enc_xor, dec_xor_bad, "wrong-pw"))
+        enc_sm3 = tmp / "text.txt.sm3err.encx"
+        engine.encrypt_file(reg.find("sm3-stream"), samples["text.txt"], enc_sm3, "pw-测试123")
+        check("SM3 错密码被立即拒绝",
+              expect_raises(WrongPasswordError, engine.decrypt_file,
+                            reg.find("sm3-stream"), enc_sm3, tmp / "bad3.out", "wrong-pw"))
+        dec_xor_bad.unlink(missing_ok=True)
         dec_bad.unlink(missing_ok=True)
 
         # 篡改密文中间一个字节
@@ -227,6 +253,70 @@ def main() -> int:
         ]
         check("密钥插件失败任务无残留输出", not leftovers2, str(leftovers2))
 
+        # ---------- v2 元数据安全（审计 F2/F4/F5 修复验证） ----------
+        print("== v2 元数据安全 ==")
+        big = samples["big_random.bin"]
+        f2_cases = []
+        for pid in ("aes-256-gcm", "sm4-gcm"):
+            e = tmp / f"big_random.bin.{pid}.encx"
+            engine.encrypt_file(reg.find(pid), big, e, "pw-测试123")
+            f2_cases.append((pid, e, 2 + 4 + 16 + 8, "pw-测试123"))
+        e_rsa = tmp / "big_random.bin.rsa-f2.encx"
+        engine.encrypt_file(rsa_p, big, e_rsa, str(rsa_pub))
+        f2_cases.append(("rsa-oaep-aes256gcm", e_rsa, 1 + 2 + 384 + 8, str(rsa_priv)))
+        e_ecc = tmp / "big_random.bin.ecc-f2.encx"
+        engine.encrypt_file(ecc_p, big, e_ecc, str(ecc_pub))
+        f2_cases.append(("ecdh-aes256gcm", e_ecc, 1 + 2 + 33 + 12 + 48 + 8, str(ecc_priv)))
+        s2_pub, s2_priv = reg.find("sm2-sm4-gcm").generate_keypair(tmp / "keys_f2")
+        e_sm2 = tmp / "big_random.bin.sm2-f2.encx"
+        engine.encrypt_file(reg.find("sm2-sm4-gcm"), big, e_sm2, str(s2_pub))
+        f2_cases.append(("sm2-sm4-gcm", e_sm2, 1 + 112 + 8, str(s2_priv)))
+
+        for pid, enc_path, off, cred in f2_cases:
+            out = tmp / "f2.encx"
+            truncate_rewrite_total(enc_path, out, off)
+            check(f"F2 截断+改总长被拒 [{pid}]",
+                  expect_raises((WrongPasswordError, IntegrityError), engine.decrypt_file,
+                                reg.find(pid), out, tmp / "f2.out", cred))
+
+        # 流插件：截断（无 total 字段，MAC 直接覆盖密文）
+        for pid in ("xor-stream", "sm3-stream"):
+            e = tmp / f"big_random.bin.{pid}.encx"
+            engine.encrypt_file(reg.find(pid), big, e, "pw-测试123")
+            raw = bytearray(e.read_bytes())
+            del raw[len(raw) - 100:]
+            (tmp / "f2s.encx").write_bytes(raw)
+            check(f"F2 密文截断被拒 [{pid}]",
+                  expect_raises((WrongPasswordError, IntegrityError), engine.decrypt_file,
+                                reg.find(pid), tmp / "f2s.encx", tmp / "f2s.out", "pw-测试123"))
+
+        # F5：流插件比特翻转 / 头部 id 交换
+        flip = tmp / "flip.encx"
+        raw = bytearray((tmp / "text.txt.x.encx").read_bytes())
+        raw[30] ^= 0x01
+        flip.write_bytes(raw)
+        check("XOR 比特翻转被拒（v2 MAC）",
+              expect_raises(IntegrityError, engine.decrypt_file,
+                            xor, flip, tmp / "flip.out", "pw-测试123"))
+        swap = tmp / "swap.encx"
+        raw = bytearray((tmp / "text.txt.x.encx").read_bytes())
+        raw[7 : 7 + 10] = b"sm3-stream"
+        swap.write_bytes(raw)
+        check("头部插件 id 交换被拒",
+              expect_raises((IntegrityError, WrongPasswordError, ContainerError),
+                            engine.decrypt_file, reg.find("sm3-stream"), swap,
+                            tmp / "swap.out", "pw-测试123"))
+
+        # F4：KDF 参数自描述（600k 写入元数据）
+        from encryptor import container as _ct
+        with open(tmp / "big_random.bin.aes-256-gcm.encx", "rb") as f:
+            info = _ct.read_container(f)
+        meta = info.metadata
+        check("元数据版本 v2", meta[0] == 2, str(meta[:2]))
+        check("KDF 标识与迭代数自描述（600k）",
+              meta[1] == 1 and int.from_bytes(meta[2:6], "big") == 600_000,
+              f"kdf={meta[1]} iters={int.from_bytes(meta[2:6], 'big')}")
+
         # ---------- 带口令的私钥 ----------
         print("== 带口令的私钥 ==")
         pub_e, priv_e = rsa_p.generate_keypair(tmp / "keys_enc", passphrase="top-secret-PW")
@@ -309,6 +399,44 @@ def main() -> int:
         leftovers4 = [p.name for p in tmp.iterdir()
                       if p.name.startswith(("w6", "w7", "w8", "w9", "w10", "w11"))]
         check("国密失败任务无残留输出", not leftovers4, str(leftovers4))
+
+        # F1 回归证明：敏感随机数路径完全不依赖 random 模块（MT19937）
+        import random as _random
+        import contextlib
+
+        @contextlib.contextmanager
+        def _random_must_not_be_called():
+            def _boom(*a, **k):
+                raise AssertionError("敏感路径调用了 random 模块!")
+            orig = _random.choice, _random.getrandbits, _random.random
+            _random.choice = _random.getrandbits = _random.random = _boom
+            try:
+                yield
+            finally:
+                _random.choice, _random.getrandbits, _random.random = orig
+
+        mt_pub = tmp / "mt_sm2"
+        with _random_must_not_be_called():
+            m_pub, m_priv = sm2p.generate_keypair(mt_pub)
+            m_enc = tmp / "mt.encx"
+            engine.encrypt_file(sm2p, samples["one_byte.txt"], m_enc, str(m_pub))
+            m_out = tmp / "mt.out"
+            engine.decrypt_file(sm2p, m_enc, m_out, str(m_priv))
+        check("SM2 密钥生成/加解密全程不触碰 random(MT19937)",
+              m_out.read_bytes() == samples["one_byte.txt"].read_bytes())
+
+        # F3 回归：伪造 C1（不在曲线上）必须被拒
+        forged = tmp / "forged_c1.encx"
+        raw = bytearray(enc_sm2.read_bytes())
+        import struct as _st3
+        (mlen3,) = _st3.unpack("<I", bytes(raw[-4:]))
+        meta_off3 = len(raw) - 4 - mlen3
+        for i in range(64):
+            raw[meta_off3 + 1 + i] = (i * 7 + 13) & 0xFF   # C1 换成非曲线点
+        forged.write_bytes(raw)
+        check("伪造 C1（不在曲线上）被拒",
+              expect_raises(IntegrityError, engine.decrypt_file,
+                            sm2p, forged, tmp / "forged.out", str(s_priv2)))
 
         # ---------- 密钥强度下限 ----------
         print("== 密钥强度下限 ==")

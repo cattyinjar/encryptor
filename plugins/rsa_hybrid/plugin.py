@@ -1,22 +1,22 @@
-"""RSA-OAEP + AES-256-GCM 混合加密插件（密钥文件模式）。
+"""RSA-OAEP + AES-256-GCM 混合加密插件（密钥文件模式，元数据 v2）。
 
-为什么是"混合"：RSA 单次只能加密略小于模长的数据（3072 位密钥约 360 字节），
-无法直接加密大文件。本插件采用与 TLS/PGP 相同的标准思路：
+混合结构（TLS/PGP 同思路，RSA 单次只能加密小于模长的数据）：
 
-  1. 随机生成 32 字节内容密钥 CEK；
-  2. 文件内容用 CEK 做逐块 AES-256-GCM（分块方案同 aes-256-gcm 插件）；
+  1. 每次加密随机生成 32 字节内容密钥 CEK；
+  2. 文件内容用 CEK 做逐块 AES-256-GCM（共享层 encryptor/aead.py：块 AAD
+     绑定插件 id，trailer MAC 认证全部元数据，修复审计 F2 无声截断）；
   3. CEK 用接收方 RSA 公钥做 OAEP(SHA-256) 加密，密文存入容器元数据。
 
-密钥文件为标准 PEM 格式（公钥 SubjectPublicKeyInfo / 私钥 PKCS#8），
-与 openssl 等工具生成的密钥互相通用：
-  openssl genrsa -out rsa_private_key.pem 3072
-  openssl rsa -in rsa_private_key.pem -pubout -out rsa_public_key.pem
+密钥文件为标准 PEM（SubjectPublicKeyInfo / PKCS#8），与 openssl 互通；
+加密选公钥文件，解密选私钥文件。加载时强制强度下限（<2048 位拒绝）。
 
-用法：加密选公钥文件，解密选私钥文件（无需密码）。
+元数据布局（大端，v2）::
 
-元数据布局（大端）::
+    ver(1)=2 ‖ wrapped_len(2) ‖ wrapped CEK ‖ nonce_prefix(8) ‖ 明文总长(8) ‖ MAC(32)
 
-    wrapped_cek_len(2) || wrapped_cek(=RSA 模长字节数) || nonce_prefix(8) || 明文总长(8)
+  MAC = HMAC-SHA256(mac_key, 除 MAC 外全部元数据 ‖ 插件 id)，mac_key 由 CEK 派生。
+
+依赖：cryptography。
 """
 
 from __future__ import annotations
@@ -25,17 +25,12 @@ import os
 from pathlib import Path
 from typing import BinaryIO, Optional, Tuple
 
-try:
-    from cryptography.exceptions import InvalidTag
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError as _exc:  # 由插件管理器捕获并展示原因
-    raise ImportError(
-        "本插件依赖第三方库 cryptography，请先执行: pip install cryptography"
-    ) from _exc
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.ciphers import algorithms as _algs
 
+from encryptor import aead
 from encryptor.sdk import (
     CryptoPlugin,
     IntegrityError,
@@ -45,22 +40,9 @@ from encryptor.sdk import (
     secure_zero,
 )
 
-CHUNK_SIZE = 1024 * 1024          # 1 MiB，同 aes-256-gcm 插件
-CEK_LEN = 32                      # AES-256 内容密钥
-NONCE_PREFIX_LEN = 8              # + 4 字节块计数 = 12 字节 GCM nonce
-TAG_LEN = 16                      # GCM 认证标签
+CEK_LEN = 32
 KEYGEN_BITS = 3072
-_META_TAIL_LEN = NONCE_PREFIX_LEN + 8
-
-
-def _read_exact(src: BinaryIO, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        part = src.read(n - len(buf))
-        if not part:
-            break
-        buf += part
-    return bytes(buf)
+_META_MIN = 1 + 2 + aead.NONCE_PREFIX_LEN + 8 + aead.MAC_LEN
 
 
 def _oaep():
@@ -132,51 +114,10 @@ def _load_private_key(credential: str, passphrase: Optional[str] = None) -> rsa.
         secure_zero(data)  # 私钥文件内容字节，解析完立即清零
 
 
-def _stream_encrypt(cipher: AESGCM, nonce_prefix: bytes, src: BinaryIO, dst: BinaryIO,
-                    on_progress: ProgressFn) -> int:
-    total, index = 0, 0
-    while True:
-        chunk = _read_exact(src, CHUNK_SIZE)
-        if not chunk:
-            break
-        nonce = nonce_prefix + index.to_bytes(4, "big")
-        dst.write(cipher.encrypt(nonce, chunk, None))
-        total += len(chunk)
-        on_progress(len(chunk))
-        index += 1
-        if len(chunk) < CHUNK_SIZE:
-            break
-    return total
-
-
-def _stream_decrypt(cipher: AESGCM, nonce_prefix: bytes, expect_total: int,
-                    src: BinaryIO, dst: BinaryIO, on_progress: ProgressFn) -> None:
-    total, index = 0, 0
-    while True:
-        blob = _read_exact(src, CHUNK_SIZE + TAG_LEN)
-        if not blob:
-            break
-        if len(blob) <= TAG_LEN:
-            raise IntegrityError("密文块不完整，文件已损坏")
-        nonce = nonce_prefix + index.to_bytes(4, "big")
-        try:
-            plain = cipher.decrypt(nonce, blob, None)
-        except InvalidTag:
-            raise WrongPasswordError("私钥不匹配，或文件已被篡改/损坏")
-        dst.write(plain)
-        total += len(plain)
-        on_progress(len(plain))
-        index += 1
-    if total != expect_total:
-        raise IntegrityError(
-            f"解密长度不符（期望 {expect_total} 字节，实际 {total} 字节），文件可能被截断"
-        )
-
-
 class Plugin(CryptoPlugin):
     id = "rsa-oaep-aes256gcm"
     name = "RSA 混合加密（OAEP）"
-    version = "1.0.0"
+    version = "2.0.0"
     author = "Encryptor 内置示例"
     description = (
         "密钥文件模式：文件用随机 AES-256-GCM 密钥加密，该密钥再用你的 RSA 公钥"
@@ -187,6 +128,7 @@ class Plugin(CryptoPlugin):
     decrypt_credential_hint = "私钥文件"
     supports_keygen = True
     keyfile_needs_passphrase = True   # 私钥可能是带口令的加密 PEM
+    authenticated = True
 
     def describe_credential(self, credential, passphrase=None) -> str:
         try:
@@ -248,15 +190,25 @@ class Plugin(CryptoPlugin):
     ) -> bytes:
         public_key = _load_public_key(credential or "")
         cek = os.urandom(CEK_LEN)
+        mac_key = None
         try:
-            nonce_prefix = os.urandom(NONCE_PREFIX_LEN)
+            nonce_prefix = os.urandom(aead.NONCE_PREFIX_LEN)
             wrapped = public_key.encrypt(cek, _oaep())
-            total = _stream_encrypt(AESGCM(cek), nonce_prefix, src, dst, on_progress)
-            return (
-                len(wrapped).to_bytes(2, "big") + wrapped + nonce_prefix + total.to_bytes(8, "big")
+            total = aead.stream_encrypt(
+                cek, _algs.AES, nonce_prefix, src, dst,
+                on_progress, self.id.encode("ascii"),
+            )
+            mac_key = aead.meta_mac_key(cek, hashes.SHA256)
+            meta = (
+                bytes([aead.META_VERSION])
+                + len(wrapped).to_bytes(2, "big") + wrapped
+                + nonce_prefix + total.to_bytes(8, "big")
+            )
+            return meta + aead.hmac_digest(
+                hashes.SHA256, mac_key, meta + self.id.encode("ascii")
             )
         finally:
-            secure_zero(cek)
+            secure_zero(cek, mac_key)
 
     def decrypt_stream(
         self,
@@ -267,24 +219,40 @@ class Plugin(CryptoPlugin):
         on_progress: ProgressFn,
         passphrase: Optional[str] = None,
     ) -> None:
-        if len(metadata) < 2 + _META_TAIL_LEN:
-            raise IntegrityError("元数据不完整，文件可能已损坏")
-        wrap_len = int.from_bytes(metadata[:2], "big")
-        wrapped = metadata[2 : 2 + wrap_len]
-        off = 2 + wrap_len
-        nonce_prefix = metadata[off : off + NONCE_PREFIX_LEN]
-        expect_total = int.from_bytes(metadata[off + NONCE_PREFIX_LEN : off + _META_TAIL_LEN], "big")
-        if len(wrapped) != wrap_len or len(nonce_prefix) != NONCE_PREFIX_LEN:
+        if len(metadata) < _META_MIN or metadata[0] != aead.META_VERSION:
+            raise IntegrityError("元数据长度或版本不正确，文件可能已损坏")
+        wrap_len = int.from_bytes(metadata[1:3], "big")
+        wrapped = metadata[3 : 3 + wrap_len]
+        off = 3 + wrap_len
+        nonce_prefix = metadata[off : off + aead.NONCE_PREFIX_LEN]
+        expect_total = int.from_bytes(
+            metadata[off + aead.NONCE_PREFIX_LEN : -aead.MAC_LEN], "big"
+        )
+        mac = metadata[-aead.MAC_LEN:]
+        if len(wrapped) != wrap_len or len(nonce_prefix) != aead.NONCE_PREFIX_LEN:
             raise IntegrityError("元数据不完整，文件可能已损坏")
 
         private_key = _load_private_key(credential or "", passphrase)
         cek = None
+        mac_key = None
         try:
             try:
                 cek = private_key.decrypt(wrapped, _oaep())
             except ValueError as exc:
                 raise WrongPasswordError("私钥不匹配，或文件已被篡改/损坏") from exc
-            _stream_decrypt(AESGCM(cek), nonce_prefix, expect_total, src, dst, on_progress)
+            # trailer MAC 先验：无声截断（F2）与元数据篡改在此立即暴露
+            mac_key = aead.meta_mac_key(cek, hashes.SHA256)
+            expect_mac = aead.hmac_digest(
+                hashes.SHA256, mac_key, metadata[:-aead.MAC_LEN] + self.id.encode("ascii")
+            )
+            if not aead.constant_time_equal(expect_mac, mac):
+                raise IntegrityError("元数据校验失败，文件已被篡改或损坏。")
+            aead.stream_decrypt(
+                cek, _algs.AES, nonce_prefix, expect_total, src, dst,
+                on_progress, self.id.encode("ascii"),
+            )
         finally:
             if cek is not None:
                 secure_zero(cek)
+            if mac_key is not None:
+                secure_zero(mac_key)

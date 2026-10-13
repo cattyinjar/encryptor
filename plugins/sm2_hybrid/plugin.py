@@ -1,29 +1,36 @@
-"""SM2 混合加密插件（国密套件，密钥文件模式）。
+"""SM2 混合加密插件（国密套件，密钥文件模式）——审计修复后 v2 实现。
 
-完整国密三件套组合，结构同 RSA/ECC 混合插件：
+红队审计（attack_lab，F1/F3/F7）后的重写要点：
+
+  * **随机数全接管**：私钥与每次加密的临时密钥 k 全部来自 CSPRNG
+    （``CryptoPlugin.secure_random_int``，os.urandom 拒绝采样）。不再使用
+    gmssl 的 ``random_hex``（MT19937，审计实测可预测私钥，F1）；
+  * **不再调用 gmssl 的 encrypt/decrypt**，SM2 加解密在本插件内自实现：
+    - 解密前校验 C1 在标准曲线上（F3，GB/T 32918 强制要求）；
+    - 解密时校验 C3（gmssl 原实现跳过，错误私钥会静默输出乱码）；
+    - 全程 bytes/bytearray，无十六进制字符串副本（F7 的 CEK hex 残留路径）；
+  * 依赖仅剩 cryptography（SM3/SM4）；gmssl 只在测试中用于交叉验证。
+
+结构（完整国密三件套）：
 
   1. 每次加密随机生成 16 字节内容密钥 CEK（SM4 密钥长度）；
-  2. 文件内容用 CEK 做逐块 SM4-GCM（同 sm4-gcm 插件的分块方案）；
-  3. CEK 用接收方 SM2 公钥加密（GB/T 32918 标准算法，C1C3C2 格式），
-     连同 SM3(CEK) 校验值一起存入元数据。
+  2. 文件内容用 CEK 做逐块 SM4-GCM（共享层 encryptor/aead.py，块 AAD 绑定
+     插件 id，元数据尾 MAC 认证全部字段，修复无声截断 F2）；
+  3. CEK 用接收方 SM2 公钥加密（C1C3C2 格式），连同元数据 MAC 一起存入容器。
 
-为什么要 SM3(CEK) 校验值：gmssl 的 SM2 解密在私钥不匹配时不报错而是
-返回乱码，且空文件没有内容块可供 GCM 校验——元数据里的 SM3(CEK) 让
-"私钥是否正确"在解密一开始就有明确答案，与文件大小无关。
+密钥文件格式（Encryptor 自有封装，标准 SM2 推荐曲线参数）::
 
-密钥文件格式（Encryptor 自有封装，使用标准 SM2 推荐曲线参数；
-openssl 的 SM2 文件是 ASN.1 结构，与本格式不直接互通）::
-
-    公钥   -----BEGIN SM2 PUBLIC KEY-----      base64(64 字节: x || y)
-    私钥   -----BEGIN SM2 PRIVATE KEY-----     base64(32 字节)
+    公钥     -----BEGIN SM2 PUBLIC KEY-----          base64(64 字节 x||y)
+    私钥     -----BEGIN SM2 PRIVATE KEY-----         base64(32 字节)
     加密私钥 -----BEGIN ENCRYPTED SM2 PRIVATE KEY-----
-           base64(salt(16) || nonce(12) || SM4-GCM 密文(48))   ← 口令保护
+             base64(salt(16) || nonce(12) || SM4-GCM 密文(48))   ← 口令保护
 
-元数据布局（大端）::
+元数据布局（大端，v2）::
 
-    sm2_ct_len(2) || sm2 密文(112) || SM3(CEK)(32) || nonce_prefix(8) || 明文总长(8)
+    ver(1)=2 || sm2 密文 C1(64)‖C3(32)‖C2(16) || nonce_prefix(8)
+    || 明文总长(8) || MAC(32)
 
-依赖：cryptography（SM3/SM4）与 gmssl（SM2，pip install gmssl）。
+  MAC = HMAC-SM3(mac_key, 上述除 MAC 外全部字节 ‖ 插件 id)，mac_key 由 CEK 派生。
 """
 
 from __future__ import annotations
@@ -33,22 +40,11 @@ import os
 from pathlib import Path
 from typing import BinaryIO, Optional, Tuple
 
-try:
-    from gmssl import sm2 as gm_sm2
-    from gmssl import func as gm_func
-except ImportError as _exc:  # 由插件管理器捕获并展示原因
-    raise ImportError("本插件依赖第三方库 gmssl，请先执行: pip install gmssl") from _exc
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import algorithms as _ciphers
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-try:
-    from cryptography.exceptions import InvalidTag
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-except ImportError as _exc:
-    raise ImportError(
-        "本插件依赖第三方库 cryptography，请先执行: pip install cryptography"
-    ) from _exc
-
+from encryptor import aead
 from encryptor.sdk import (
     CryptoPlugin,
     IntegrityError,
@@ -58,19 +54,151 @@ from encryptor.sdk import (
     secure_zero,
 )
 
+# ---------------------------------------------------------------- SM2 曲线
+# GB/T 32918-2016 推荐曲线参数（256 位）。tests/test_sm2_crypto.py 会与
+# gmssl 的 default_ecc_table 交叉核对，防止抄写错误。
+
+_P = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFF
+_A = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFC
+_B = 0x28E9FA9E9D9F5E344D5A9E4BCF6509A7F39789F515AB8F92DDBCBD414D940E93
+_N = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123
+_G = (
+    0x32C4AE2C1F1981195F9904466A39C9948FE30BBFF2660BE1715A4589334C74C7,
+    0xBC3736A2F4F6779C59BDCEE36B692153D0A9877CC62A474002DF32E52139F0A0,
+)
+
 CEK_LEN = 16                       # SM4 密钥 128 位
-SM2_CT_LEN = 112                   # C1(64) || C3(32) || C2(=CEK 16)，C1 不含 04 前缀
-CHUNK_SIZE = 1024 * 1024
-NONCE_PREFIX_LEN = 8
-TAG_LEN = 16
+SM2_CT_LEN = 112                   # C1(64) || C3(32) || C2(=CEK 16)
+CHUNK_SIZE = aead.CHUNK_SIZE
+NONCE_PREFIX_LEN = aead.NONCE_PREFIX_LEN
+TAG_LEN = aead.TAG_LEN
 SALT_LEN = 16
 WRAP_NONCE_LEN = 12
 PRIV_LEN = 32
 PUB_LEN = 64
-KEYFILE_ROUNDS = 200_000
+KEYFILE_ROUNDS = aead.DEFAULT_ITERATIONS
 SM4_KEY_LEN = 16
-# 元数据中 sm2 密文之后的固定尾段：SM3(CEK) + nonce 前缀 + 总长
-_META_TAIL_LEN = 32 + NONCE_PREFIX_LEN + 8
+_META_HEAD_LEN = 1 + SM2_CT_LEN + NONCE_PREFIX_LEN + 8   # ver + sm2ct + np + total
+_META_LEN = _META_HEAD_LEN + aead.MAC_LEN
+
+
+# ---------------------------------------------------------------- 点运算
+
+def _inv(x: int) -> int:
+    return pow(x, -1, _P)
+
+
+def _add(p1, p2):
+    """仿射坐标点加；None 表示无穷远点。"""
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2:
+        if (y1 + y2) % _P == 0:
+            return None
+        lam = (3 * x1 * x1 + _A) * _inv(2 * y1) % _P
+    else:
+        lam = (y2 - y1) * _inv(x2 - x1) % _P
+    x3 = (lam * lam - x1 - x2) % _P
+    y3 = (lam * (x1 - x3) - y1) % _P
+    return x3, y3
+
+
+def _mul(k: int, point):
+    """二进制展开标量乘（非常数时间：本地工具，无远程计时面，见审计 F6）。"""
+    result, addend = None, point
+    while k:
+        if k & 1:
+            result = _add(result, addend)
+        addend = _add(addend, addend)
+        k >>= 1
+    return result
+
+
+def _on_curve(point) -> bool:
+    x, y = point
+    if not (0 <= x < _P and 0 <= y < _P):
+        return False
+    return (y * y - (x * x * x + _A * x + _B)) % _P == 0
+
+
+def _point_to_bytes(point) -> bytes:
+    return point[0].to_bytes(32, "big") + point[1].to_bytes(32, "big")
+
+
+def _bytes_to_point(data: bytes):
+    return int.from_bytes(data[:32], "big"), int.from_bytes(data[32:], "big")
+
+
+# ---------------------------------------------------------------- SM3 / KDF
+
+def _sm3(data: bytes) -> bytes:
+    h = hashes.Hash(hashes.SM3())
+    h.update(data)
+    return h.finalize()
+
+
+def _kdf(z: bytes, klen: int) -> bytes:
+    """GM/T 0003.4 KDF：t = SM3(Z ‖ ct)，ct = 1,2,…（不校验全零输出由调用方负责）。"""
+    out = bytearray()
+    ct = 1
+    while len(out) < klen:
+        out += _sm3(z + ct.to_bytes(4, "big"))
+        ct += 1
+    return bytes(out[:klen])
+
+
+# ---------------------------------------------------------------- SM2 加解密
+
+def _sm2_encrypt(plaintext: bytes, pub_point) -> bytes:
+    """GB/T 32918 标准加密，输出 C1(64B) ‖ C3(32B) ‖ C2。k 来自 CSPRNG。
+
+    C3 = SM3(x2 ‖ M ‖ y2)，x2/y2 来自共享点 S = k·P（不是 C1）。
+    """
+    for _ in range(64):  # t 全零的概率约 2^-128，循环仅为形式完备
+        k = CryptoPlugin.secure_random_int(_N)
+        c1 = _mul(k, _G)
+        s = _mul(k, pub_point)
+        if c1 is None or s is None:
+            continue
+        z = _point_to_bytes(s)
+        t = _kdf(z, len(plaintext))
+        if any(t):
+            try:
+                c2 = bytes(a ^ b for a, b in zip(plaintext, t))
+                c3 = _sm3(z[:32] + plaintext + z[32:])
+                return _point_to_bytes(c1) + c3 + c2
+            finally:
+                secure_zero(t)
+                secure_zero(z)
+    raise PluginError("SM2 加密：KDF 输出异常")
+
+
+def _sm2_decrypt(wrapped: bytes, priv: int):
+    """解密并校验 C1 在曲线 / C3 一致。返回明文；任何失败按异常报告。"""
+    if len(wrapped) != SM2_CT_LEN:
+        raise IntegrityError("SM2 密文长度不正确，文件可能已损坏")
+    c1_bytes, c3, c2 = wrapped[:64], wrapped[64:96], wrapped[96:]
+    c1 = _bytes_to_point(c1_bytes)
+    if not _on_curve(c1):
+        raise IntegrityError("SM2 密文 C1 不在标准曲线上，文件无效或被篡改")
+    s = _mul(priv, c1)
+    if s is None:
+        raise IntegrityError("SM2 解密得到无穷远点，文件无效")
+    z = _point_to_bytes(s)
+    t = _kdf(z, len(c2))
+    try:
+        plaintext = bytes(a ^ b for a, b in zip(c2, t))
+        c3_check = _sm3(z[:32] + plaintext + z[32:])
+    finally:
+        secure_zero(t)
+        secure_zero(z)
+    if c3_check != c3:
+        raise WrongPasswordError("私钥不匹配，或文件已被篡改/损坏")
+    return plaintext
 
 
 # ---------------------------------------------------------------- 密钥文件
@@ -91,30 +219,6 @@ def _dearmor(data: bytes, marker: str) -> bytes:
     return base64.b64decode("".join(middle.split()), validate=False)
 
 
-def _curve_params() -> dict:
-    empty = gm_sm2.CryptSM2(public_key="", private_key="")
-    return {
-        "g": empty.ecc_table["g"],
-        "n": int(empty.ecc_table["n"], 16),
-        "p": int(empty.ecc_table["p"], 16),
-    }
-
-
-def _generate_keypair_raw() -> Tuple[bytes, bytes]:
-    """返回 (私钥 32B, 公钥 64B)。"""
-    table = _curve_params()
-    while True:
-        priv_hex = gm_func.random_hex(PRIV_LEN * 2)
-        d = int(priv_hex, 16)
-        if 1 <= d < table["n"]:
-            break
-    maker = gm_sm2.CryptSM2(public_key="", private_key=priv_hex)
-    pub_hex = maker._kg(d, table["g"])  # x||y 十六进制（gmssl 内部标量乘法）
-    if len(pub_hex) != PUB_LEN * 2:
-        raise PluginError("SM2 公钥生成结果异常")
-    return d.to_bytes(PRIV_LEN, "big"), bytes.fromhex(pub_hex)
-
-
 def _load_public_key(credential: str) -> bytes:
     path = Path(credential)
     try:
@@ -127,9 +231,17 @@ def _load_public_key(credential: str) -> bytes:
         raise PluginError("公钥文件解析失败：不是有效的 SM2 公钥文件。") from exc
     if len(pub) != PUB_LEN:
         raise PluginError("SM2 公钥长度不正确（需要 64 字节 x||y）。")
-    if pub == bytes(PUB_LEN):
-        raise PluginError("SM2 公钥无效（全零）。")
+    if not _on_curve(_bytes_to_point(pub)):
+        raise PluginError("SM2 公钥不在标准曲线上，文件无效。")
     return pub
+
+
+def _gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    return aead.gcm_encrypt(key, _ciphers.SM4, nonce, plaintext, b"")
+
+
+def _gcm_decrypt(key: bytes, nonce: bytes, blob: bytes) -> bytes:
+    return aead.gcm_decrypt(key, _ciphers.SM4, nonce, blob, b"")
 
 
 def _decrypt_priv_blob(blob: bytes, passphrase: Optional[str]):
@@ -143,12 +255,9 @@ def _decrypt_priv_blob(blob: bytes, passphrase: Optional[str]):
         algorithm=hashes.SM3(), length=SM4_KEY_LEN, salt=salt, iterations=KEYFILE_ROUNDS
     ).derive(passphrase.encode("utf-8"))
     try:
-        dec = Cipher(algorithms.SM4(key), modes.GCM(nonce, ct[-TAG_LEN:])).decryptor()
-        try:
-            priv = dec.update(ct[:-TAG_LEN]) + dec.finalize()
-        except InvalidTag:
-            raise WrongPasswordError("私钥口令错误，或私钥文件已损坏。") from None
-        return priv
+        return _gcm_decrypt(key, nonce, ct)
+    except WrongPasswordError:
+        raise WrongPasswordError("私钥口令错误，或私钥文件已损坏。") from None
     finally:
         secure_zero(key)
 
@@ -173,98 +282,28 @@ def _load_private_key(credential: str, passphrase: Optional[str] = None) -> byte
             raise PluginError("私钥文件解析失败：不是有效的 SM2 私钥文件。") from exc
         if len(priv) != PRIV_LEN:
             raise PluginError("SM2 私钥长度不正确（需要 32 字节）。")
-        d = int.from_bytes(priv, "big")
-        if not 1 <= d < _curve_params()["n"]:
+        if not 1 <= int.from_bytes(priv, "big") < _N:
             raise PluginError("SM2 私钥数值无效。")
         return priv
     finally:
-        secure_zero(data)  # 私钥文件内容字节（含明文/密文信封），解析完立即清零
-
-
-# ---------------------------------------------------------------- 内容层 SM4-GCM
-
-def _read_exact(src: BinaryIO, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        part = src.read(n - len(buf))
-        if not part:
-            break
-        buf += part
-    return bytes(buf)
-
-
-def _sm3(data: bytes) -> bytes:
-    h = hashes.Hash(hashes.SM3())
-    h.update(data)
-    return h.finalize()
-
-
-def _gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
-    enc = Cipher(algorithms.SM4(key), modes.GCM(nonce)).encryptor()
-    ct = enc.update(plaintext) + enc.finalize()
-    return ct + enc.tag
-
-
-def _gcm_decrypt(key: bytes, nonce: bytes, blob: bytes) -> bytes:
-    dec = Cipher(algorithms.SM4(key), modes.GCM(nonce, blob[-TAG_LEN:])).decryptor()
-    return dec.update(blob[:-TAG_LEN]) + dec.finalize()
-
-
-def _stream_encrypt(cek: bytes, nonce_prefix: bytes, src: BinaryIO, dst: BinaryIO,
-                    on_progress: ProgressFn) -> int:
-    total, index = 0, 0
-    while True:
-        chunk = _read_exact(src, CHUNK_SIZE)
-        if not chunk:
-            break
-        nonce = nonce_prefix + index.to_bytes(4, "big")
-        dst.write(_gcm_encrypt(cek, nonce, chunk))
-        total += len(chunk)
-        on_progress(len(chunk))
-        index += 1
-        if len(chunk) < CHUNK_SIZE:
-            break
-    return total
-
-
-def _stream_decrypt(cek: bytes, nonce_prefix: bytes, expect_total: int,
-                    src: BinaryIO, dst: BinaryIO, on_progress: ProgressFn) -> None:
-    total, index = 0, 0
-    while True:
-        blob = _read_exact(src, CHUNK_SIZE + TAG_LEN)
-        if not blob:
-            break
-        if len(blob) <= TAG_LEN:
-            raise IntegrityError("密文块不完整，文件已损坏")
-        nonce = nonce_prefix + index.to_bytes(4, "big")
-        try:
-            plain = _gcm_decrypt(cek, nonce, blob)
-        except InvalidTag:
-            raise WrongPasswordError("私钥不匹配，或文件已被篡改/损坏")
-        dst.write(plain)
-        total += len(plain)
-        on_progress(len(plain))
-        index += 1
-    if total != expect_total:
-        raise IntegrityError(
-            f"解密长度不符（期望 {expect_total} 字节，实际 {total} 字节），文件可能被截断"
-        )
+        secure_zero(data)  # 私钥文件内容字节，解析完立即清零
 
 
 class Plugin(CryptoPlugin):
     id = "sm2-sm4-gcm"
     name = "SM2 混合加密（国密套件）"
-    version = "1.0.0"
+    version = "2.0.0"
     author = "Encryptor 内置示例"
     description = (
-        "密钥文件模式（国密）：SM2 公钥保护随机 SM4 内容密钥（附 SM3 校验），"
-        "文件逐块 SM4-GCM 加密；加密选公钥文件，解密选私钥文件"
+        "密钥文件模式（国密）：SM2 公钥保护随机 SM4 内容密钥，文件逐块 SM4-GCM "
+        "认证加密；加密选公钥文件，解密选私钥文件"
     )
     credential_mode = "keyfile"
     encrypt_credential_hint = "公钥文件"
     decrypt_credential_hint = "私钥文件"
     supports_keygen = True
     keyfile_needs_passphrase = True   # 私钥可能带口令（SM4-GCM 信封）
+    authenticated = True
 
     def describe_credential(self, credential, passphrase=None) -> str:
         try:
@@ -288,9 +327,14 @@ class Plugin(CryptoPlugin):
             raise PluginError(
                 f"目录下已存在 {pub_path.name} / {priv_path.name}，请换一个目录或先删除旧密钥。"
             )
-        priv, pub = _generate_keypair_raw()
+        # CSPRNG 私钥（审计 F1 修复：不再使用 gmssl random_hex/MT19937）
+        d = self.secure_random_int(_N)
+        pub_point = _mul(d, _G)
+        if pub_point is None:
+            raise PluginError("SM2 公钥生成失败")
+        priv = d.to_bytes(PRIV_LEN, "big")
         try:
-            pub_path.write_bytes(_armor("SM2 PUBLIC KEY", pub))
+            pub_path.write_bytes(_armor("SM2 PUBLIC KEY", _point_to_bytes(pub_point)))
             if passphrase:
                 salt = os.urandom(SALT_LEN)
                 nonce = os.urandom(WRAP_NONCE_LEN)
@@ -302,7 +346,6 @@ class Plugin(CryptoPlugin):
                     blob = salt + nonce + _gcm_encrypt(key, nonce, priv)
                 finally:
                     secure_zero(key)
-                    secure_zero(salt)  # 盐不保密，但保持信封材料一并清理
                 priv_path.write_bytes(_armor("ENCRYPTED SM2 PRIVATE KEY", blob))
             else:
                 priv_path.write_bytes(_armor("SM2 PRIVATE KEY", priv))
@@ -320,25 +363,21 @@ class Plugin(CryptoPlugin):
     ) -> bytes:
         pub = _load_public_key(credential or "")
         cek = os.urandom(CEK_LEN)
+        mac_key = None
         try:
-            crypt = gm_sm2.CryptSM2(
-                public_key=pub.hex(), private_key="", mode=1, asn1=False
-            )
-            try:
-                wrapped = crypt.encrypt(cek)
-            except Exception as exc:
-                raise PluginError(f"SM2 加密内容密钥失败：{exc}") from exc
-            if len(wrapped) != SM2_CT_LEN:
-                raise PluginError(f"SM2 密文长度异常（{len(wrapped)} 字节）。")
-
+            wrapped = _sm2_encrypt(cek, _bytes_to_point(pub))
             nonce_prefix = os.urandom(NONCE_PREFIX_LEN)
-            total = _stream_encrypt(cek, nonce_prefix, src, dst, on_progress)
-            return (
-                len(wrapped).to_bytes(2, "big")
-                + wrapped + _sm3(cek) + nonce_prefix + total.to_bytes(8, "big")
+            total = aead.stream_encrypt(
+                cek, _ciphers.SM4, nonce_prefix, src, dst, on_progress, self.id.encode("ascii")
             )
+            mac_key = aead.meta_mac_key(cek, hashes.SM3)
+            meta = (
+                bytes([aead.META_VERSION]) + wrapped + nonce_prefix
+                + total.to_bytes(8, "big")
+            )
+            return meta + aead.hmac_digest(hashes.SM3, mac_key, meta + self.id.encode("ascii"))
         finally:
-            secure_zero(cek)
+            secure_zero(cek, mac_key)
 
     def decrypt_stream(
         self,
@@ -349,34 +388,31 @@ class Plugin(CryptoPlugin):
         on_progress: ProgressFn,
         passphrase: Optional[str] = None,
     ) -> None:
-        if len(metadata) < 2 + _META_TAIL_LEN:
-            raise IntegrityError("元数据不完整，文件可能已损坏")
-        ct_len = int.from_bytes(metadata[:2], "big")
-        wrapped = metadata[2 : 2 + ct_len]
-        off = 2 + ct_len
-        cek_check = metadata[off : off + 32]
-        nonce_prefix = metadata[off + 32 : off + 32 + NONCE_PREFIX_LEN]
-        expect_total = int.from_bytes(metadata[off + 32 + NONCE_PREFIX_LEN : off + _META_TAIL_LEN], "big")
-        if len(wrapped) != ct_len or len(cek_check) != 32 or len(nonce_prefix) != NONCE_PREFIX_LEN:
-            raise IntegrityError("元数据不完整，文件可能已损坏")
+        if len(metadata) != _META_LEN or metadata[0] != aead.META_VERSION:
+            raise IntegrityError("元数据长度或版本不正确，文件可能已损坏")
+        wrapped = metadata[1 : 1 + SM2_CT_LEN]
+        off = 1 + SM2_CT_LEN
+        nonce_prefix = metadata[off : off + NONCE_PREFIX_LEN]
+        expect_total = int.from_bytes(metadata[off + NONCE_PREFIX_LEN : -aead.MAC_LEN], "big")
+        mac = metadata[-aead.MAC_LEN:]
 
         priv = _load_private_key(credential or "", passphrase)
         cek = None
+        mac_key = None
         try:
-            crypt = gm_sm2.CryptSM2(
-                public_key="", private_key=priv.hex(), mode=1, asn1=False
+            cek = _sm2_decrypt(wrapped, int.from_bytes(priv, "big"))
+            mac_key = aead.meta_mac_key(cek, hashes.SM3)
+            expect_mac = aead.hmac_digest(
+                hashes.SM3, mac_key, metadata[:-aead.MAC_LEN] + self.id.encode("ascii")
             )
-            try:
-                cek = crypt.decrypt(wrapped)
-            except Exception as exc:
-                raise IntegrityError(f"SM2 解密内容密钥失败：{exc}") from exc
-            # gmssl 对错误私钥静默返回乱码，用 SM3(CEK) 判定私钥是否正确
-            if not cek or _sm3(cek) != cek_check:
-                raise WrongPasswordError("私钥不匹配，或文件已被篡改/损坏")
-            _stream_decrypt(cek, nonce_prefix, expect_total, src, dst, on_progress)
+            if expect_mac != mac:
+                raise IntegrityError("元数据校验失败，文件已被篡改或损坏。")
+            aead.stream_decrypt(
+                cek, _ciphers.SM4, nonce_prefix, expect_total, src, dst,
+                on_progress, self.id.encode("ascii"),
+            )
         finally:
-            # 注：priv.hex() 会产生一份不可变十六进制字符串副本，str 无法可靠清零
-            # （CPython 限制，见 securemem 模块文档）；字节副本在此全部清零。
             if cek is not None:
                 secure_zero(cek)
-            secure_zero(priv)
+            if mac_key is not None:
+                secure_zero(mac_key)
