@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import ctypes.wintypes as wt
 import hashlib
 import shutil
 import subprocess
@@ -42,21 +43,33 @@ HKDF_INFO = b"encryptor/ecdh-aes256gcm/kek"
 # ---------------------------------------------------------------- 转储
 
 def dump_process(pid: int, out: Path) -> None:
-    kernel32 = ctypes.WinDLL("kernel32")
-    dbghelp = ctypes.WinDLL("dbghelp")
-    handle = kernel32.OpenProcess(0x1F0FFF, False, pid)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    dbghelp = ctypes.WinDLL("dbghelp", use_last_error=True)
+    # 句柄是 64 位指针：必须显式声明 restype，否则被截断成 c_int
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD,
+                                     ctypes.c_void_p, wt.DWORD, wt.DWORD, ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    PROCESS_ALL_ACCESS = 0x1F0FFF
+    handle = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
     if not handle:
-        raise ctypes.WinError()
+        raise OSError("OpenProcess失败", ctypes.get_last_error())
     hfile = kernel32.CreateFileW(str(out), 0x40000000, 0, None, 2, 0x80, None)
-    if hfile == -1:
-        raise ctypes.WinError()
+    if not hfile or hfile == 0xFFFFFFFFFFFFFFFF:
+        e = ctypes.get_last_error()
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        raise OSError("CreateFileW失败", e)
+    # 2 = MiniDumpWithFullMemory（procdump -ma 同款）
     ok = dbghelp.MiniDumpWriteDump(
         ctypes.c_void_p(handle), ctypes.c_uint32(pid), ctypes.c_void_p(hfile),
-        ctypes.c_uint32(2), None, None, None)   # 2 = MiniDumpWithFullMemory
+        ctypes.c_uint32(2), None, None, None)
+    err = ctypes.get_last_error()
     kernel32.CloseHandle(ctypes.c_void_p(hfile))
     kernel32.CloseHandle(ctypes.c_void_p(handle))
     if not ok:
-        raise ctypes.WinError()
+        raise OSError("MiniDumpWriteDump失败", err)
 
 
 def scan_dump(dmp: Path, needles: dict[str, bytes]) -> dict[str, list[int]]:
