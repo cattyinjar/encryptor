@@ -655,6 +655,19 @@ class EncryptorApp:
         self.status_job.config(text=job_text if busy else "就绪")
         if not busy:
             self._cancel_flag = None
+            # N2：任务结束（成功/出错/取消）即清空口令类输入，缩短驻留窗口。
+            # 只清"秘密"：密码/确认密码/私钥口令；密钥文件路径不是秘密，保留
+            # 以免多文件解密时反复重选（keyfile 模式的路径存于 dec_pwd_var）。
+            keygen_done = getattr(self, "_keygen_ctx", None)
+            self.enc_pwd2_var.set("")
+            self.dec_keypwd_var.set("")
+            if not keygen_done:
+                self.enc_pwd_var.set("")
+            if getattr(self, "_last_job_password_mode", False):
+                self.dec_pwd_var.set("")   # 密码模式下该框装的是密码
+            if keygen_done:
+                self._keygen_ctx = None
+            self.log("任务结束：已清空口令输入框。", "info")
 
     def _validate(self, encrypt: bool):
         src_var = self.enc_src_var if encrypt else self.dec_src_var
@@ -731,6 +744,11 @@ class EncryptorApp:
 
         self._cancel_flag = threading.Event()
         action = "加密" if encrypt else "解密"
+        # 记录本次任务的凭据形态：任务结束后据此决定是否清空解密页凭据框
+        self._last_job_password_mode = (
+            getattr(plugin, "credential_mode", "password") == "password"
+            and plugin.requires_password
+        )
         self._set_busy(True, f"正在{action}…")
         bar, pct = (self.enc_bar, self.enc_bar_pct) if encrypt else (self.dec_bar, self.dec_bar_pct)
         self._active_progress = (bar, pct)

@@ -50,7 +50,7 @@ class Plugin(CryptoPlugin):
     ) -> bytes:
         salt = os.urandom(16)
         nonce_prefix = os.urandom(aead.NONCE_PREFIX_LEN)
-        enc_key, mac_key = aead.derive_dual_key(
+        enc_key, mac_key, pre_key = aead.derive_dual_key(
             password or "", salt, ITERATIONS, ENC_KEY_LEN, KDF_ID
         )
         try:
@@ -60,10 +60,10 @@ class Plugin(CryptoPlugin):
             )
             return aead.build_password_meta(
                 self.id, KDF_ID, ITERATIONS, salt, nonce_prefix, total,
-                mac_key, hashes.SM3,
+                pre_key, mac_key, hashes.SM3,
             )
         finally:
-            secure_zero(enc_key, mac_key)
+            secure_zero(enc_key, mac_key, pre_key)
 
     def decrypt_stream(
         self,
@@ -73,15 +73,18 @@ class Plugin(CryptoPlugin):
         password: Optional[str],
         on_progress: ProgressFn,
     ) -> None:
-        kdf_id, iterations, salt, nonce_prefix, total, mac = aead.verify_password_meta(
+        kdf_id, iterations, salt, nonce_prefix, total, pre_mac, mac = aead.verify_password_meta(
             metadata, self.id
         )
         if kdf_id != KDF_ID:
             raise IntegrityError(f"KDF 标识不匹配（{kdf_id}），文件可能已损坏")
-        enc_key = mac_key = None
+        pre_key = enc_key = mac_key = None
         try:
-            enc_key, mac_key = aead.derive_dual_key(
-                password or "", salt, iterations, ENC_KEY_LEN, kdf_id
+            pre_key = aead.derive_pre_key(password or "", salt, kdf_id)
+            if not aead.verify_password_pre_mac(metadata, self.id, pre_key, hashes.SM3):
+                raise WrongPasswordError("密码错误，或文件已被篡改/损坏")
+            enc_key, mac_key = aead.derive_dual_key_from_pre(
+                pre_key, salt, iterations, ENC_KEY_LEN, kdf_id
             )
             mac_input, expect = aead.password_meta_mac_input(metadata, self.id)
             actual = aead.hmac_digest(hashes.SM3, mac_key, mac_input)
@@ -92,4 +95,4 @@ class Plugin(CryptoPlugin):
                 on_progress, self.id.encode("ascii"),
             )
         finally:
-            secure_zero(enc_key, mac_key)
+            secure_zero(pre_key, enc_key, mac_key)

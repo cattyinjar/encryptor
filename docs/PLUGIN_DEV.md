@@ -219,12 +219,20 @@ def encrypt_stream(self, src, dst, password, on_progress):
 公钥混合插件同样使用 aead 的内容层 + `aead.meta_mac_key(cek, hash)` 做元数据
 MAC（参考 rsa_hybrid / sm2_hybrid）。
 
-另两条硬性约定：
+另四条硬性约定：
 
 - 类属性 `authenticated = True` 只有在密文具备完整性保护（AEAD/带 MAC）时
   才能声明；未声明的插件 GUI 会向用户显示"无防篡改能力"警告并要求确认；
 - 椭圆曲线私钥/临时标量一律用 `self.secure_random_int(order)` 生成
-  （审计 F1：绝不要用 `random`/`random_hex` 等非密码学随机源）。
+  （审计 F1：绝不要用 `random`/`random_hex` 等非密码学随机源）；
+- **MAC/摘要比较一律用 `aead.constant_time_equal`**，不要写 `!=`（审计 N3）；
+- 口令模式插件的口令长度下限由 `min_password_len`（SDK 默认 8）声明，
+  **engine 在加密侧对所有调用路径强制执行**——解密侧不强制（口令由既有
+  文件决定），keyfile 模式不受影响（password 是路径）。
+
+密码派生必须走共享层的**两级 KDF**（审计 N1 修复）：先固定 1 万轮派生
+pre_key 并验证 `pre_mac`（廉价预验，覆盖声明的迭代数等全部参数），再从
+pre_key 继续全量派生——伪造文件无法再借元数据里的迭代数撬动任意 CPU。
 
 ### 敏感内存清理（必须遵守）
 

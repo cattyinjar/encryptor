@@ -31,8 +31,7 @@ KDF_ID = aead.KDF_PBKDF2_SHA256
 ITERATIONS = aead.DEFAULT_ITERATIONS     # 600k（审计 F4）
 CHUNK_SIZE = 64 * 1024
 KEYSTREAM_BLOCK = 32                     # SHA-256 输出长度
-VERIFIER_LEN = 16
-_META_LEN = 1 + 1 + 4 + 16 + VERIFIER_LEN + aead.MAC_LEN
+_META_LEN = 1 + 1 + 4 + 16 + aead.MAC_LEN * 2   # ver|kdf|iters|salt|pre_mac|mac
 
 
 def _read_exact(src: BinaryIO, n: int) -> bytes:
@@ -112,11 +111,8 @@ class Plugin(CryptoPlugin):
         from cryptography.hazmat.primitives import hashes
 
         salt = os.urandom(16)
-        key, mac_key = aead.derive_dual_key(password or "", salt, ITERATIONS, 32, KDF_ID)
+        key, mac_key, pre_key = aead.derive_dual_key(password or "", salt, ITERATIONS, 32, KDF_ID)
         try:
-            verifier = aead.hmac_digest(
-                hashes.SHA256, mac_key, b"encryptor/stream-verifier"
-            )[:VERIFIER_LEN]
             mac_ctx = _hmac_new(
                 hashes.SHA256, mac_key,
                 b"encryptor/stream-mac" + self.id.encode("ascii"),
@@ -127,13 +123,16 @@ class Plugin(CryptoPlugin):
                 dst.write(ct)
 
             _xor_stream(key, salt, src, sink, on_progress)
-            head = (
+            params = (
                 bytes([aead.META_VERSION, KDF_ID])
-                + ITERATIONS.to_bytes(4, "big") + salt + verifier
+                + ITERATIONS.to_bytes(4, "big") + salt
             )
-            return head + mac_ctx.finalize()
+            pre_mac = aead.hmac_digest(
+                hashes.SHA256, pre_key, params + self.id.encode("ascii")
+            )
+            return params + pre_mac + mac_ctx.finalize()
         finally:
-            secure_zero(key, mac_key)
+            secure_zero(key, mac_key, pre_key)
 
     def decrypt_stream(
         self,
@@ -151,19 +150,24 @@ class Plugin(CryptoPlugin):
         if kdf_id != KDF_ID:
             raise IntegrityError(f"KDF 标识不匹配（{kdf_id}），文件可能已损坏")
         iterations = int.from_bytes(metadata[2:6], "big")
+        if not 1000 <= iterations <= aead.MAX_ITERATIONS:
+            raise IntegrityError("KDF 迭代数不合理，文件可能已损坏")
         salt = metadata[6:22]
-        verifier = metadata[22 : 22 + VERIFIER_LEN]
         mac = metadata[-aead.MAC_LEN:]
 
-        key = mac_key = None
+        key = mac_key = pre_key = None
         try:
-            key, mac_key = aead.derive_dual_key(password or "", salt, iterations, 32, kdf_id)
-            # 口令预验证：错口令立即报错（不再静默输出乱码）
-            check = aead.hmac_digest(
-                hashes.SHA256, mac_key, b"encryptor/stream-verifier"
-            )[:VERIFIER_LEN]
-            if not aead.constant_time_equal(check, verifier):
+            # 廉价预验（N1）：先以固定 ~1 万轮验证参数与口令，再做全量派生
+            pre_key = aead.derive_pre_key(password or "", salt, kdf_id)
+            params = metadata[: -aead.MAC_LEN * 2]
+            expect_pre = aead.hmac_digest(
+                hashes.SHA256, pre_key, params + self.id.encode("ascii")
+            )
+            if not aead.constant_time_equal(expect_pre, metadata[-aead.MAC_LEN * 2 : -aead.MAC_LEN]):
                 raise WrongPasswordError("密码错误，或文件已被篡改/损坏。")
+            key, mac_key = aead.derive_dual_key_from_pre(
+                pre_key, salt, iterations, 32, kdf_id
+            )
 
             mac_ctx = _hmac_new(
                 hashes.SHA256, mac_key,
@@ -175,4 +179,4 @@ class Plugin(CryptoPlugin):
             if not aead.constant_time_equal(mac_ctx.finalize(), mac):
                 raise IntegrityError("密文校验失败：文件已被篡改（如比特翻转或截断）。")
         finally:
-            secure_zero(key, mac_key)
+            secure_zero(key, mac_key, pre_key)

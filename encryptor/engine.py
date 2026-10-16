@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import ENC_EXTENSION, container
-from .sdk import CancelledError, CryptoPlugin
+from .sdk import CancelledError, CryptoPlugin, PluginError
 
 ProgressFn = Callable[[int], None]
 CancelFlag = threading.Event
@@ -88,6 +88,23 @@ def _plugin_call_kwargs(plugin: CryptoPlugin, passphrase: Optional[str]) -> dict
     return {}
 
 
+def _check_encrypt_policy(plugin: CryptoPlugin, password: Optional[str]) -> None:
+    """加密侧口令策略（N4）：engine 层强制，GUI/CLI/第三方脚本同一防线。
+
+    仅对密码模式插件生效；keyfile 模式的 password 是路径，不做长度检查。
+    """
+    if (
+        password is not None
+        and getattr(plugin, "credential_mode", "password") == "password"
+        and getattr(plugin, "requires_password", True)
+    ):
+        min_len = getattr(plugin, "min_password_len", 0)
+        if min_len and len(password) < min_len:
+            raise PluginError(
+                f"密码至少需要 {min_len} 位（当前 {len(password)} 位）——engine 层策略。"
+            )
+
+
 def encrypt_file(
     plugin: CryptoPlugin,
     src_path: Path,
@@ -98,6 +115,7 @@ def encrypt_file(
     passphrase: Optional[str] = None,
 ) -> int:
     """加密 ``src_path`` → ``dst_path``，返回明文字节数。"""
+    _check_encrypt_policy(plugin, password)
     gate = _ProgressGate(on_progress, cancel)
     part = dst_path.with_name(dst_path.name + ".part")
     total = 0

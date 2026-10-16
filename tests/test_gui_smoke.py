@@ -22,16 +22,15 @@ from encryptor.app import EncryptorApp
 
 
 def wait_job(app: tk.Tk, timeout: float = 60.0) -> str:
-    """泵事件循环直到任务结束，返回最后一条日志文本。"""
+    """泵事件循环直到任务结束，返回最后几行日志文本（多行拼接，供子串断言）。"""
     deadline = time.monotonic() + timeout
-    last = ""
     while time.monotonic() < deadline:
         app.root.update()
         if not app._busy:
             break
         time.sleep(0.02)
     app.root.update()
-    return app.log_text.get("end-2c linestart", "end-1c").strip()
+    return app.log_text.get("end-5l linestart", "end-1c")
 
 
 def main() -> int:
@@ -68,6 +67,9 @@ def main() -> int:
         check("加密任务完成", enc_path.is_file(), last)
         check("日志含完成信息", "加密完成" in last, last)
         check("日志报告敏感内存已清零", "敏感内存已清零" in last, last)
+        check("N2 任务结束后口令框被清空",
+              app.enc_pwd_var.get() == "" and app.enc_pwd2_var.get() == "",
+              repr(app.enc_pwd_var.get()))
 
         # ---- 解密（自动识别插件路径） ----
         app.dec_src_var.set(str(enc_path))

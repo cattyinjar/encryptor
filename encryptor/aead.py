@@ -33,12 +33,14 @@ from .sdk import IntegrityError, WrongPasswordError
 
 ProgressFn = Callable[[int], None]
 
-META_VERSION = 2
+META_VERSION = 3
 CHUNK_SIZE = 1024 * 1024
 TAG_LEN = 16                      # GCM 认证标签
 NONCE_PREFIX_LEN = 8              # + 4 字节块计数 = 12 字节 GCM nonce
 MAC_LEN = 32                      # trailer MAC（SHA-256 与 SM3 均为 32 字节）
 DEFAULT_ITERATIONS = 600_000      # OWASP 2023 起 PBKDF2 建议值
+PRE_ITERS = 10_000                # 预验 KDF 固定轮数（N1：攻击者成本上限 ≈ 5ms）
+MAX_ITERATIONS = 20_000_000       # 合理性上限（预验生效后仅为防线，非 DoS 杠杆）
 
 # KDF 算法标识（写入元数据，自描述）
 KDF_PBKDF2_SHA256 = 1
@@ -82,51 +84,94 @@ def meta_mac_key(cek: bytes, hash_cls) -> bytes:
     return hmac_digest(hash_cls, cek, b"encryptor/meta-mac-key/v2")
 
 
-def derive_dual_key(password: str, salt: bytes, iterations: int, enc_len: int,
-                    kdf_id: int) -> Tuple[bytes, bytes]:
-    """口令 → (加密密钥 enc_len 字节, MAC 密钥 32 字节)。
+def derive_pre_key(password: str, salt: bytes, kdf_id: int) -> bytes:
+    """第一级派生：固定 PRE_ITERS 轮（与文件声明的迭代数无关）。
 
-    一次 PBKDF2 派生 enc_len+32 字节后按固定偏移切分（域分隔靠位置）。
-    返回的两个密钥由调用方负责 secure_zero。
+    用于元数据预验 MAC（N1 修复）——攻击者篡改迭代数等字段时，受害者在
+    花费固定 ~1 万轮（毫秒级）后即可拒绝，无法再借元数据撬动任意 CPU 算力。
+    返回值由调用方负责 secure_zero。
     """
-    hash_cls = _KDF_HASH[kdf_id]
-    dk = PBKDF2HMAC(
-        algorithm=hash_cls(), length=enc_len + MAC_LEN,
-        salt=salt, iterations=iterations,
+    return PBKDF2HMAC(
+        algorithm=_KDF_HASH[kdf_id](), length=32, salt=salt, iterations=PRE_ITERS
     ).derive(password.encode("utf-8"))
+
+
+def derive_dual_key(password: str, salt: bytes, iterations: int, enc_len: int,
+                    kdf_id: int) -> Tuple[bytes, bytes, bytes]:
+    """两级口令派生：口令 →(1 万轮)→ pre_key →(声明轮数)→ (enc_key, mac_key, pre_key)。
+
+    第二级以 pre_key 为口令继续 PBKDF2——合法文件的总开销仅多 ~1 万轮，
+    而任何对声明轮数的篡改都会在廉价的第一级预验处被拒（N1）。
+    返回的三个密钥由调用方负责 secure_zero。
+    """
+    pre_key = derive_pre_key(password, salt, kdf_id)
+    dk = PBKDF2HMAC(
+        algorithm=_KDF_HASH[kdf_id](), length=enc_len + MAC_LEN,
+        salt=salt, iterations=iterations,
+    ).derive(pre_key)
+    return dk[:enc_len], dk[enc_len:], pre_key
+
+
+def derive_dual_key_from_pre(pre_key: bytes, salt: bytes, iterations: int,
+                             enc_len: int, kdf_id: int) -> Tuple[bytes, bytes]:
+    """两级派生的第二级：预验通过后，从已验证的 pre_key 继续派生，不重复第一级。"""
+    dk = PBKDF2HMAC(
+        algorithm=_KDF_HASH[kdf_id](), length=enc_len + MAC_LEN,
+        salt=salt, iterations=iterations,
+    ).derive(pre_key)
     return dk[:enc_len], dk[enc_len:]
 
 
 def build_password_meta(plugin_id: str, kdf_id: int, iterations: int,
                         salt: bytes, nonce_prefix: bytes, total: int,
-                        mac_key: bytes, hash_cls) -> bytes:
-    meta = (
+                        pre_key: bytes, mac_key: bytes, hash_cls) -> bytes:
+    """密码模式元数据（v3）：… ‖ pre_mac(32) ‖ mac(32)。
+
+    pre_mac = HMAC(pre_key, 参数字段 ‖ 插件 id)   —— 廉价预验（N1）
+    mac     = HMAC(mac_key, 参数字段 ‖ pre_mac ‖ 插件 id)
+    """
+    params = (
         bytes([META_VERSION, kdf_id])
         + iterations.to_bytes(4, "big")
         + salt + nonce_prefix + total.to_bytes(8, "big")
     )
-    return meta + hmac_digest(hash_cls, mac_key, meta + plugin_id.encode("ascii"))
+    pre_mac = hmac_digest(hash_cls, pre_key, params + plugin_id.encode("ascii"))
+    mac = hmac_digest(hash_cls, mac_key, params + pre_mac + plugin_id.encode("ascii"))
+    return params + pre_mac + mac
 
 
 def verify_password_meta(metadata: bytes, plugin_id: str):
-    """解析并校验密码模式元数据，返回 (kdf_id, iters, salt, nonce_prefix, total)。
+    """解析密码模式元数据（v3），返回 (kdf_id, iters, salt, np, total, pre_mac, mac)。
 
-    MAC 校验失败按"密码错误"处理（错口令与元数据篡改在此不可区分，均拒绝）。
+    只做结构校验；pre_mac 的验证见 verify_password_pre_mac（必须先于全量 KDF）。
     """
-    fixed = 2 + 4 + 16 + NONCE_PREFIX_LEN + 8 + MAC_LEN
+    fixed = 2 + 4 + 16 + NONCE_PREFIX_LEN + 8 + MAC_LEN * 2
     if len(metadata) != fixed or metadata[0] != META_VERSION:
         raise IntegrityError("元数据长度或版本不正确，文件可能已损坏")
     kdf_id = metadata[1]
     if kdf_id not in _KDF_HASH:
         raise IntegrityError(f"未知的 KDF 标识 {kdf_id}")
     iterations = int.from_bytes(metadata[2:6], "big")
-    if not 1000 <= iterations <= 100_000_000:
+    if not 1000 <= iterations <= MAX_ITERATIONS:
         raise IntegrityError("KDF 迭代数不合理，文件可能已损坏")
     salt = metadata[6:22]
     nonce_prefix = metadata[22 : 22 + NONCE_PREFIX_LEN]
-    total = int.from_bytes(metadata[22 + NONCE_PREFIX_LEN : -MAC_LEN], "big")
+    total = int.from_bytes(metadata[22 + NONCE_PREFIX_LEN : -MAC_LEN * 2], "big")
+    pre_mac = metadata[-MAC_LEN * 2 : -MAC_LEN]
     mac = metadata[-MAC_LEN:]
-    return kdf_id, iterations, salt, nonce_prefix, total, mac
+    return kdf_id, iterations, salt, nonce_prefix, total, pre_mac, mac
+
+
+def verify_password_pre_mac(metadata: bytes, plugin_id: str, pre_key: bytes,
+                            hash_cls) -> bool:
+    """廉价预验（N1）：固定 PRE_ITERS 轮派生后验证 pre_mac。
+
+    覆盖全部参数字段（含声明的迭代数）与插件 id——通过后才允许执行
+    声明轮数的全量 KDF。失败按"密码错误或文件被篡改"处理。
+    """
+    params = metadata[: -MAC_LEN * 2]
+    expect = hmac_digest(hash_cls, pre_key, params + plugin_id.encode("ascii"))
+    return constant_time_equal(expect, metadata[-MAC_LEN * 2 : -MAC_LEN])
 
 
 def password_meta_mac_input(metadata: bytes, plugin_id: str) -> Tuple[bytes, bytes]:

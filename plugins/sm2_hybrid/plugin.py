@@ -405,7 +405,7 @@ class Plugin(CryptoPlugin):
             expect_mac = aead.hmac_digest(
                 hashes.SM3, mac_key, metadata[:-aead.MAC_LEN] + self.id.encode("ascii")
             )
-            if expect_mac != mac:
+            if not aead.constant_time_equal(expect_mac, mac):
                 raise IntegrityError("元数据校验失败，文件已被篡改或损坏。")
             aead.stream_decrypt(
                 cek, _ciphers.SM4, nonce_prefix, expect_total, src, dst,

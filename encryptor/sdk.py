@@ -72,6 +72,10 @@ class CryptoPlugin:
     description: str = ""
     requires_password: bool = True
     password_hint: str = "密码"
+    # 加密侧口令长度下限（engine 层强制，任何调用路径都生效；GUI 另有弱口令表）。
+    # keyfile 模式不受影响（password 参数是密钥文件路径）。解密侧不强制——
+    # 口令由既有文件决定。
+    min_password_len: int = 8
     # 算法是否具备完整性保护（AEAD/带 MAC）。默认 False——第三方插件必须
     # 显式声明 True，GUI 才不会在选择时向用户显示"无防篡改能力"警告。
     authenticated: bool = False

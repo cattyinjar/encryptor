@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -307,15 +308,62 @@ def main() -> int:
                             engine.decrypt_file, reg.find("sm3-stream"), swap,
                             tmp / "swap.out", "pw-测试123"))
 
-        # F4：KDF 参数自描述（600k 写入元数据）
+        # F4/N1：KDF 参数自描述（600k 写入元数据，版本 v3）
         from encryptor import container as _ct
         with open(tmp / "big_random.bin.aes-256-gcm.encx", "rb") as f:
             info = _ct.read_container(f)
         meta = info.metadata
-        check("元数据版本 v2", meta[0] == 2, str(meta[:2]))
+        check("元数据版本 v3", meta[0] == 3, str(meta[:2]))
         check("KDF 标识与迭代数自描述（600k）",
               meta[1] == 1 and int.from_bytes(meta[2:6], "big") == 600_000,
               f"kdf={meta[1]} iters={int.from_bytes(meta[2:6], 'big')}")
+
+        # N1：伪造大迭代数必须被廉价预验快速拒绝（不烧全量 KDF 的 CPU）
+        import struct as _st4
+
+        def forge_iterations(src: Path, out: Path, iters: int) -> None:
+            raw = bytearray(src.read_bytes())
+            (m4,) = _st4.unpack("<I", bytes(raw[-4:]))
+            moff = len(raw) - 4 - m4
+            raw[moff + 2 : moff + 6] = iters.to_bytes(4, "big")
+            out.write_bytes(raw)
+
+        n1_file = tmp / "n1_maxiter.encx"
+        forge_iterations(tmp / "big_random.bin.aes-256-gcm.encx", n1_file, 20_000_000)
+        t0 = time.time()
+        rejected = expect_raises((WrongPasswordError, IntegrityError),
+                                 engine.decrypt_file, aes, n1_file,
+                                 tmp / "n1.out", "pw-测试123")
+        dt = time.time() - t0
+        check("N1 伪造 2000 万轮迭代被拒", rejected)
+        check(f"N1 拒绝耗时 {dt:.2f}s（预验生效，<2s）", dt < 2.0, f"{dt:.2f}s")
+        n1_over = tmp / "n1_over.encx"
+        forge_iterations(tmp / "big_random.bin.aes-256-gcm.encx", n1_over, 99_999_999)
+        check("N1 超上限迭代数被结构性拒绝",
+              expect_raises(IntegrityError, engine.decrypt_file, aes, n1_over,
+                            tmp / "n1b.out", "pw-测试123"))
+
+        # N4：engine 层口令策略（加密侧，任何调用路径）
+        check("N4 engine 拒绝过短口令",
+              expect_raises(Exception, engine.encrypt_file, aes,
+                            samples["text.txt"], tmp / "n4.encx", "short"))
+        ok_enc = tmp / "n4_ok.encx"
+        engine.encrypt_file(aes, samples["text.txt"], ok_enc, "pw-足够长度-12345")
+        check("N4 engine 接受合规口令", ok_enc.is_file())
+        # keyfile 模式（password=路径）与无密码插件不适用长度策略
+        try:
+            engine._check_encrypt_policy(rsa_p, "x")       # keyfile：不检查
+            engine._check_encrypt_policy(aes, None)        # 无口令：不检查
+            keyfile_ok = True
+        except Exception as exc:
+            keyfile_ok = False
+        check("N4 策略仅作用于密码模式插件", keyfile_ok)
+        try:
+            engine._check_encrypt_policy(aes, "short")
+            policy_hit = False
+        except Exception:
+            policy_hit = True
+        check("N4 策略对密码模式短口令生效", policy_hit)
 
         # ---------- 带口令的私钥 ----------
         print("== 带口令的私钥 ==")
