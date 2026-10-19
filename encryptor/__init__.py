@@ -8,7 +8,7 @@
     app             Tkinter GUI
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 APP_NAME = "Encryptor"
 # 本软件自有的加密文件扩展名

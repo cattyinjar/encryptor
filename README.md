@@ -174,12 +174,10 @@ python tests/test_roundtrip.py
 python tests/test_gui_smoke.py
 ```
 
-## 打包为独立 exe（可选）
+## 打包为标准 Windows 软件（可选）
 
-```bash
-pip install pyinstaller
-pyinstaller --noconsole --onefile --add-data "plugins;plugins" --add-data "encryptor;encryptor" main.py
-```
-
-（如需把插件做成可插拔的外部目录，把 `plugins/` 放在 exe 旁并在
-`plugin_manager.default_plugins_dir()` 中调整定位逻辑即可。）
+完整流程（PyInstaller + Inno Setup 安装包、开始菜单/桌面快捷方式、
+注册表注册：卸载项 + `HKLM\Software\Encryptor` + `.encx` 文件关联——
+双击加密文件即启动软件并定位到解密页）见 **[docs/PACKAGING.md](docs/PACKAGING.md)**。
+成品：`packaging/installer/Encryptor-Setup-<版本>.exe`；安装后可用
+`Encryptor.exe --selftest` 自检（退出码 0 = 通过）。

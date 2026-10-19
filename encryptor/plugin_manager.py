@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import sys
 import threading
@@ -25,6 +26,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .sdk import CryptoPlugin
+
+# 冻结（PyInstaller）环境下，捆绑的 OpenSSL 3 找不到 legacy provider 的
+# 配置会直接抛错；本软件不使用任何 legacy 算法（RC2/DES 等），禁用之。
+# 必须在任何插件（进而 cryptography）导入之前生效。
+os.environ.setdefault("CRYPTOGRAPHY_OPENSSL_NO_LEGACY", "1")
 
 _VALID_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _REQUIRED_METHODS = ("encrypt_stream", "decrypt_stream")
@@ -74,7 +80,9 @@ class PluginRegistry:
 
 
 def default_plugins_dir() -> Path:
-    """插件目录 = 项目根目录下的 plugins/。"""
+    """插件目录：源码运行 = 项目根/plugins；PyInstaller 打包后 = exe 所在目录/plugins。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "plugins"
     return Path(__file__).resolve().parent.parent / "plugins"
 
 

@@ -8,3 +8,6 @@
 *.pem
 *.txt
 *.2
+build/
+dist/
+packaging/

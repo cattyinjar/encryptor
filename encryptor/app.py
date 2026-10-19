@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import os
 import queue
+import sys
 import threading
 import time
-import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
@@ -532,7 +532,10 @@ class EncryptorApp:
             self.log(f"插件目录：{path}", "info")
 
     def _open_plugin_doc(self) -> None:
-        doc = Path(__file__).resolve().parent.parent / "docs" / "PLUGIN_DEV.md"
+        if getattr(sys, "frozen", False):
+            doc = Path(sys.executable).resolve().parent / "docs" / "PLUGIN_DEV.md"
+        else:
+            doc = Path(__file__).resolve().parent.parent / "docs" / "PLUGIN_DEV.md"
         if doc.is_file():
             try:
                 os.startfile(doc)  # type: ignore[attr-defined]
@@ -572,8 +575,10 @@ class EncryptorApp:
             filetypes=[("Encryptor 加密文件", f"*{ENC_EXTENSION}"), ("所有文件", "*.*")],
             parent=self.root,
         )
-        if not path:
-            return
+        if path:
+            self._handle_decrypt_source(path)
+
+    def _handle_decrypt_source(self, path: str) -> None:
         self.dec_src_var.set(path)
         src = Path(path)
         self.dec_dst_var.set(str(src.with_name(engine.decrypted_name(src))))
@@ -592,6 +597,16 @@ class EncryptorApp:
         else:
             self.log("警告：文件头不是有效的 Encryptor 加密格式，无法自动识别算法。", "err")
         self.log(f"已选择待解密文件：{path}", "info")
+
+    def open_encx_file(self, path: str) -> None:
+        """供双击 .encx / 命令行传参打开：切到解密页并预填。"""
+        if not Path(path).is_file():
+            return
+        try:
+            self.notebook.select(1)
+        except tk.TclError:
+            pass
+        self._handle_decrypt_source(path)
 
     def _pick_decrypt_dest(self) -> None:
         initial = self.dec_dst_var.get()
@@ -837,7 +852,13 @@ class EncryptorApp:
         self.log_text.config(state="disabled")
 
 
-def main() -> None:
+def run_app(open_file: Optional[str] = None) -> None:
     root = tk.Tk()
-    EncryptorApp(root)
+    app = EncryptorApp(root)
+    if open_file:
+        app.open_encx_file(open_file)
     root.mainloop()
+
+
+def main() -> None:
+    run_app()
