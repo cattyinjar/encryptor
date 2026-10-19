@@ -1,4 +1,0 @@
-== Encryptor 自检 2026-10-16 23:03:42 ==
-插件目录：F:\Projects\encryptor\plugins
-已加载插件（7）：['aes-256-gcm', 'ecdh-aes256gcm', 'rsa-oaep-aes256gcm', 'sm2-sm4-gcm', 'sm3-stream', 'sm4-gcm', 'xor-stream']
-== 自检结束：5/5 通过 ==
